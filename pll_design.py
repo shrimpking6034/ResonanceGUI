@@ -105,5 +105,7 @@ def design_pll(*, phase_slope_deg_per_hz, f0_hz, q, demod_tc_s,
     bw, pm, gm, ms, finite = _metrics(p, i, d, phase_slope_deg_per_hz, f0_hz, q,
                                        demod_tc_s, demod_order, loop_rate_hz)
     stable = finite and pm >= minimum_phase_margin_deg and ms <= 2.5
-    message = "설계 완료" if stable else "목표 조건을 만족하는 안정 설계를 찾지 못했습니다. 더 낮은 BW를 시도하세요."
+    message = ("설계 완료" if stable else
+               "현재 TC/order/PID 선택으로 목표 BW를 만족하는 안정 설계를 찾지 못했습니다. "
+               "계수를 적용하지 말고 TC, filter order 또는 목표 BW를 조정하세요.")
     return PLLDesign(p, i, d, bw, pm, gm, ms, stable, message)

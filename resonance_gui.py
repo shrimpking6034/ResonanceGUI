@@ -56,15 +56,15 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QDoubleSpinBox, QSpinBox, QPushButton, QGroupBox, QListWidget,
     QListWidgetItem, QMessageBox, QComboBox, QProgressBar, QTabWidget,
-    QScrollArea, QCheckBox, QFileDialog, QLineEdit,
+    QScrollArea, QCheckBox, QFileDialog, QLineEdit, QToolButton,
+    QSizePolicy, QSplitter,
 )
 import pyqtgraph as pg
-from scipy.signal import find_peaks, peak_widths
-
 from zi_hf2_api import ZiHF2, ZiAPIError
 from beam_modes import TubeBeam, calculate_modes
 from sweep_math import make_filter_plan, average_complex_samples, tc_from_bandwidth_3db
-from resonance_fit import fit_complex_resonance, model_response
+from resonance_fit import (fit_complex_resonance, model_response,
+                           detect_resonance_peaks, assess_fit_quality)
 from pll_design import design_pll
 from baseline_analysis import (timing_quality, linear_baseline, rolling_metrics,
                                event_timescale_noise, false_event_distribution,
@@ -103,7 +103,7 @@ HF2_DEMOD = 0                 # demodulator reading the sense piezo (for R/theta
 HF2_PLL = 0
 
 MAX_DRIVE_V = 10.0            # hard safety limit, HF2LI output feeds the piezo directly
-APP_VERSION = "2026.09.07"
+APP_VERSION = "2026.09.08.1"
 OUTPUT_RANGE_OPTIONS = [("10 mV", 0.01), ("100 mV", 0.1), ("1 V", 1.0), ("10 V", 10.0)]
 
 # Default to the NI-MAX alias used by the original control program.  Startup
@@ -185,6 +185,39 @@ def setup_dual_axis(plot):
     plot.vb.sigResized.connect(update_views)
     update_views()
     return vb2
+
+
+class CollapsibleSection(QWidget):
+    """Compact disclosure section used by the long left control panel."""
+
+    def __init__(self, title, content, expanded=False, parent=None):
+        super().__init__(parent)
+        self.content = content
+        if isinstance(content, QGroupBox):
+            content.setTitle("")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.toggle = QToolButton()
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(bool(expanded))
+        self.toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.toggle.setStyleSheet(
+            "QToolButton { text-align: left; font-weight: bold; padding: 6px; "
+            "border: 1px solid #b8b8b8; background: #eeeeee; }"
+        )
+        self.content.setVisible(bool(expanded))
+        self.toggle.toggled.connect(self._set_expanded)
+        layout.addWidget(self.toggle)
+        layout.addWidget(self.content)
+
+    def _set_expanded(self, expanded):
+        self.toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.content.setVisible(expanded)
+        self.updateGeometry()
 
 
 # ---------------------------------------------------------------------------
@@ -836,12 +869,14 @@ class MainWindow(QMainWindow):
         left = QVBoxLayout()
         left_widget = QWidget()
         left_widget.setLayout(left)
+        left_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         left_scroll = QScrollArea()
         left_scroll.setWidget(left_widget)
         left_scroll.setWidgetResizable(True)
-        left_scroll.setMinimumWidth(460)
-        left_scroll.setMaximumWidth(520)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setMinimumWidth(500)
+        left_scroll.setMaximumWidth(700)
 
         self.status_label = QLabel("연결 안 됨")
         self.status_label.setStyleSheet("font-weight: bold;")
@@ -849,11 +884,15 @@ class MainWindow(QMainWindow):
 
         left.addWidget(self._build_drive_group())
         left.addWidget(self._build_signal_input_group())
-        left.addWidget(self._build_theory_group())
+        left.addWidget(CollapsibleSection(
+            "이론 모드 — 양단 고정 금속관", self._build_theory_group(), expanded=False,
+        ))
         left.addWidget(self._build_sweep_group())
         left.addWidget(self._build_peak_group())
         left.addWidget(self._build_pll_group())
-        left.addWidget(self._build_experiment_metadata_group())
+        left.addWidget(CollapsibleSection(
+            "5. 실험조건 metadata", self._build_experiment_metadata_group(), expanded=False,
+        ))
         left.addWidget(self._build_plotter_group())
         left.addWidget(self._build_daq_group())
         left.addWidget(self._build_pingpong_group())
@@ -866,8 +905,6 @@ class MainWindow(QMainWindow):
         emergency_btn.clicked.connect(self.emergency_stop)
         left.addWidget(emergency_btn)
 
-        root.addWidget(left_scroll)
-
         # ---- right plot column (tabs: Sweeper / PLL / Plotter) ----
         pg.setConfigOption('background', 'w')
         pg.setConfigOption('foreground', 'k')
@@ -877,7 +914,14 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_pll_tab(), "② PLL (Response)")
         self.tabs.addTab(self._build_plotter_tab(), "③ Plotter (Freq & R vs Time)")
         self.tabs.addTab(self._build_baseline_tab(), "④ Baseline Analysis")
-        root.addWidget(self.tabs, 1)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(left_scroll)
+        splitter.addWidget(self.tabs)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([540, 1410])
+        root.addWidget(splitter)
 
     # --- Sweeper tab ---
     def _build_sweep_tab(self):
@@ -1160,6 +1204,7 @@ class MainWindow(QMainWindow):
     def _build_sweep_group(self):
         g = QGroupBox("2. Sweeper — 주파수 스윕")
         layout = QGridLayout(g)
+        layout.setColumnStretch(1, 1)
 
         layout.addWidget(QLabel("시작 주파수 (Hz):"), 0, 0)
         self.f_start_spin = QDoubleSpinBox()
@@ -1181,82 +1226,91 @@ class MainWindow(QMainWindow):
         self.n_points_spin.setValue(500)
         layout.addWidget(self.n_points_spin, 2, 1)
 
-        layout.addWidget(QLabel("필터 모드:"), 3, 0)
+        advanced = QWidget()
+        advanced_layout = QGridLayout(advanced)
+        advanced_layout.setContentsMargins(6, 4, 6, 4)
+        advanced_layout.setColumnStretch(1, 1)
+
+        advanced_layout.addWidget(QLabel("필터 모드:"), 0, 0)
         self.sweep_filter_mode_combo = QComboBox()
         self.sweep_filter_mode_combo.addItems(["Manual", "Fixed", "Auto"])
         self.sweep_filter_mode_combo.setCurrentText("Auto")
         self.sweep_filter_mode_combo.setToolTip("Manual은 현재 Lock-in 필터를 유지합니다. Fixed/Auto는 스윕 중에만 적용 후 복원합니다.")
-        layout.addWidget(self.sweep_filter_mode_combo, 3, 1)
+        advanced_layout.addWidget(self.sweep_filter_mode_combo, 0, 1)
 
-        layout.addWidget(QLabel("필터 차수 (1–8):"), 4, 0)
+        advanced_layout.addWidget(QLabel("필터 차수 (1–8):"), 1, 0)
         self.sweep_filter_order_spin = QSpinBox()
         self.sweep_filter_order_spin.setRange(1, 8)
         self.sweep_filter_order_spin.setValue(4)
-        layout.addWidget(self.sweep_filter_order_spin, 4, 1)
+        advanced_layout.addWidget(self.sweep_filter_order_spin, 1, 1)
 
-        layout.addWidget(QLabel("Fixed BW 3dB (Hz):"), 5, 0)
+        advanced_layout.addWidget(QLabel("Fixed BW 3dB (Hz):"), 2, 0)
         self.sweep_fixed_bw_spin = QDoubleSpinBox()
         self.sweep_fixed_bw_spin.setRange(0.001, 200000)
         self.sweep_fixed_bw_spin.setValue(100.0)
-        layout.addWidget(self.sweep_fixed_bw_spin, 5, 1)
+        advanced_layout.addWidget(self.sweep_fixed_bw_spin, 2, 1)
 
-        layout.addWidget(QLabel("Auto 최대 BW (Hz):"), 6, 0)
+        advanced_layout.addWidget(QLabel("Auto 최대 BW (Hz):"), 3, 0)
         self.sweep_max_bw_spin = QDoubleSpinBox()
         self.sweep_max_bw_spin.setRange(0.001, 1.25e6)
         self.sweep_max_bw_spin.setValue(1.25e6)
-        layout.addWidget(self.sweep_max_bw_spin, 6, 1)
+        advanced_layout.addWidget(self.sweep_max_bw_spin, 3, 1)
 
-        layout.addWidget(QLabel("ω/2ω 억제 (dB):"), 7, 0)
+        advanced_layout.addWidget(QLabel("ω/2ω 억제 (dB):"), 4, 0)
         self.sweep_suppression_spin = QDoubleSpinBox()
         self.sweep_suppression_spin.setRange(0, 160)
         self.sweep_suppression_spin.setValue(40.0)
-        layout.addWidget(self.sweep_suppression_spin, 7, 1)
+        advanced_layout.addWidget(self.sweep_suppression_spin, 4, 1)
 
         self.sweep_overlap_check = QCheckBox("BW overlap 허용")
         self.sweep_overlap_check.setChecked(False)
-        layout.addWidget(self.sweep_overlap_check, 8, 0, 1, 2)
+        advanced_layout.addWidget(self.sweep_overlap_check, 5, 0, 1, 2)
 
-        layout.addWidget(QLabel("최소 정착시간 (s):"), 9, 0)
+        advanced_layout.addWidget(QLabel("최소 정착시간 (s):"), 6, 0)
         self.sweep_min_settle_spin = QDoubleSpinBox()
         self.sweep_min_settle_spin.setRange(0.0, 100.0)
         self.sweep_min_settle_spin.setDecimals(4)
         self.sweep_min_settle_spin.setValue(0.0)
-        layout.addWidget(self.sweep_min_settle_spin, 9, 1)
+        advanced_layout.addWidget(self.sweep_min_settle_spin, 6, 1)
 
-        layout.addWidget(QLabel("정착 잔류오차:"), 10, 0)
+        advanced_layout.addWidget(QLabel("정착 잔류오차:"), 7, 0)
         self.sweep_residual_spin = QDoubleSpinBox()
         self.sweep_residual_spin.setRange(1e-10, 0.1)
         self.sweep_residual_spin.setDecimals(8)
         self.sweep_residual_spin.setValue(0.0001)
-        layout.addWidget(self.sweep_residual_spin, 10, 1)
+        advanced_layout.addWidget(self.sweep_residual_spin, 7, 1)
 
-        layout.addWidget(QLabel("평균 최소 샘플 수:"), 11, 0)
+        advanced_layout.addWidget(QLabel("평균 최소 샘플 수:"), 8, 0)
         self.sweep_samples_spin = QSpinBox()
         self.sweep_samples_spin.setRange(1, 100000)
         self.sweep_samples_spin.setValue(1)
-        layout.addWidget(self.sweep_samples_spin, 11, 1)
+        advanced_layout.addWidget(self.sweep_samples_spin, 8, 1)
 
-        layout.addWidget(QLabel("평균 최소 시간 (s):"), 12, 0)
+        advanced_layout.addWidget(QLabel("평균 최소 시간 (s):"), 9, 0)
         self.sweep_avg_time_spin = QDoubleSpinBox()
         self.sweep_avg_time_spin.setRange(0.0, 100.0)
         self.sweep_avg_time_spin.setDecimals(4)
         self.sweep_avg_time_spin.setValue(0.0)
-        layout.addWidget(self.sweep_avg_time_spin, 12, 1)
+        advanced_layout.addWidget(self.sweep_avg_time_spin, 9, 1)
 
-        layout.addWidget(QLabel("평균 TC 수:"), 13, 0)
+        advanced_layout.addWidget(QLabel("평균 TC 수:"), 10, 0)
         self.sweep_avg_tc_spin = QDoubleSpinBox()
         self.sweep_avg_tc_spin.setRange(0.0, 1000.0)
         self.sweep_avg_tc_spin.setValue(0.0)
-        layout.addWidget(self.sweep_avg_tc_spin, 13, 1)
+        advanced_layout.addWidget(self.sweep_avg_tc_spin, 10, 1)
 
-        layout.addWidget(QLabel("샘플 rate (Sa/s):"), 14, 0)
+        advanced_layout.addWidget(QLabel("샘플 rate (Sa/s):"), 11, 0)
         self.sweep_rate_spin = QDoubleSpinBox()
         self.sweep_rate_spin.setRange(1.0, 410000.0)
         self.sweep_rate_spin.setValue(224.9)
-        layout.addWidget(self.sweep_rate_spin, 14, 1)
+        advanced_layout.addWidget(self.sweep_rate_spin, 11, 1)
+
+        layout.addWidget(CollapsibleSection(
+            "고급 스윕 설정", advanced, expanded=False,
+        ), 3, 0, 1, 2)
 
         self.sweep_progress = QProgressBar()
-        layout.addWidget(self.sweep_progress, 15, 0, 1, 2)
+        layout.addWidget(self.sweep_progress, 4, 0, 1, 2)
 
         btn_row = QHBoxLayout()
         self.run_sweep_btn = QPushButton("스윕 시작")
@@ -1266,7 +1320,7 @@ class MainWindow(QMainWindow):
         self.stop_sweep_btn.clicked.connect(self.stop_sweep)
         btn_row.addWidget(self.run_sweep_btn)
         btn_row.addWidget(self.stop_sweep_btn)
-        layout.addLayout(btn_row, 16, 0, 1, 2)
+        layout.addLayout(btn_row, 5, 0, 1, 2)
 
         return g
 
@@ -1274,6 +1328,7 @@ class MainWindow(QMainWindow):
         g = QGroupBox("3. Sweeper Math — 공진 피크 (Q / Center / Phase)")
         layout = QVBoxLayout(g)
         self.peak_list = QListWidget()
+        self.peak_list.setMaximumHeight(160)
         self.peak_list.currentRowChanged.connect(self.on_peak_list_row_changed)
         layout.addWidget(self.peak_list)
         hint = QLabel("그래프의 빨간 점을 직접 클릭해도 선택됩니다.")
@@ -1556,10 +1611,15 @@ class MainWindow(QMainWindow):
         self.baseline_stop_btn.clicked.connect(self.stop_baseline_test)
         layout.addWidget(self.baseline_stop_btn, 4, 0, 1, 2)
 
+        baseline_analysis = QWidget()
+        baseline_layout = QGridLayout(baseline_analysis)
+        baseline_layout.setContentsMargins(6, 4, 6, 4)
+        baseline_layout.setColumnStretch(1, 1)
+
         self.baseline_stats_label = QLabel("Baseline 분석: 아직 측정 데이터가 없습니다.")
         self.baseline_stats_label.setWordWrap(True)
         self.baseline_stats_label.setStyleSheet("font-weight: bold; color: #444;")
-        layout.addWidget(self.baseline_stats_label, 5, 0, 1, 2)
+        baseline_layout.addWidget(self.baseline_stats_label, 0, 0, 1, 2)
 
         analysis_row = QHBoxLayout()
         self.baseline_analysis_btn = QPushButton("Baseline 상세 분석 실행 (현재 raw 기록)")
@@ -1570,7 +1630,7 @@ class MainWindow(QMainWindow):
         self.baseline_load_btn.setToolTip("원본 CSV는 수정하지 않고 메모리에서만 derived 분석을 수행합니다.")
         self.baseline_load_btn.clicked.connect(self.load_baseline_csv_for_analysis)
         analysis_row.addWidget(self.baseline_load_btn)
-        layout.addLayout(analysis_row, 6, 0, 1, 2)
+        baseline_layout.addLayout(analysis_row, 1, 0, 1, 2)
 
         blank_row = QHBoxLayout()
         self.calibration_blank_btn = QPushButton("Threshold calibration blank 선택")
@@ -1579,29 +1639,29 @@ class MainWindow(QMainWindow):
         self.evaluation_blank_btn.clicked.connect(self.load_evaluation_blank)
         blank_row.addWidget(self.calibration_blank_btn)
         blank_row.addWidget(self.evaluation_blank_btn)
-        layout.addLayout(blank_row, 7, 0, 1, 2)
+        baseline_layout.addLayout(blank_row, 2, 0, 1, 2)
 
-        layout.addWidget(QLabel("파형 duration / method:"), 8, 0)
+        baseline_layout.addWidget(QLabel("파형 duration / method:"), 3, 0)
         detector_cfg = QHBoxLayout()
         detector_cfg.addWidget(QLabel("0.3 / 0.5 / 1.0 s"))
         self.detection_method_combo = QComboBox()
         self.detection_method_combo.addItems(["integral", "template"])
         detector_cfg.addWidget(self.detection_method_combo)
-        layout.addLayout(detector_cfg, 8, 1)
+        baseline_layout.addLayout(detector_cfg, 3, 1)
         self.event_duration_spin = QDoubleSpinBox(); self.event_duration_spin.setRange(0.01, 10.0); self.event_duration_spin.setDecimals(3); self.event_duration_spin.setValue(0.3); self.event_duration_spin.setVisible(False)
         event_cfg = QHBoxLayout()
         self.event_baseline_spin = QDoubleSpinBox(); self.event_baseline_spin.setRange(0.05, 60.0); self.event_baseline_spin.setDecimals(3); self.event_baseline_spin.setValue(0.4)
         self.event_guard_spin = QDoubleSpinBox(); self.event_guard_spin.setRange(0.0, 10.0); self.event_guard_spin.setDecimals(3); self.event_guard_spin.setValue(0.05)
         event_cfg.addWidget(self.event_baseline_spin); event_cfg.addWidget(QLabel("/")); event_cfg.addWidget(self.event_guard_spin)
-        layout.addLayout(event_cfg, 9, 1)
-        layout.addWidget(QLabel("Local baseline / guard (s):"), 9, 0)
-        layout.addWidget(QLabel("Manual peak threshold override (Hz, 0=calibration):"), 10, 0)
+        baseline_layout.addLayout(event_cfg, 4, 1)
+        baseline_layout.addWidget(QLabel("Local baseline / guard (s):"), 4, 0)
+        baseline_layout.addWidget(QLabel("Manual peak threshold override (Hz, 0=calibration):"), 5, 0)
         self.event_threshold_spin = QDoubleSpinBox(); self.event_threshold_spin.setRange(0.0, 1e6); self.event_threshold_spin.setDecimals(4); self.event_threshold_spin.setValue(0.0)
-        layout.addWidget(self.event_threshold_spin, 10, 1)
+        baseline_layout.addWidget(self.event_threshold_spin, 5, 1)
 
-        layout.addWidget(QLabel("추가 rolling window (s, 0=기본값만):"), 11, 0)
+        baseline_layout.addWidget(QLabel("추가 rolling window (s, 0=기본값만):"), 6, 0)
         self.baseline_rolling_window_spin = QDoubleSpinBox(); self.baseline_rolling_window_spin.setRange(0.0, 36000.0); self.baseline_rolling_window_spin.setDecimals(2); self.baseline_rolling_window_spin.setValue(60.0)
-        layout.addWidget(self.baseline_rolling_window_spin, 11, 1)
+        baseline_layout.addWidget(self.baseline_rolling_window_spin, 6, 1)
 
         analysis_export_row = QHBoxLayout()
         self.baseline_summary_export_btn = QPushButton("분석 Summary JSON 저장")
@@ -1616,7 +1676,7 @@ class MainWindow(QMainWindow):
         analysis_export_row.addWidget(self.baseline_summary_export_btn)
         analysis_export_row.addWidget(self.baseline_derived_export_btn)
         analysis_export_row.addWidget(self.event_export_btn)
-        layout.addLayout(analysis_export_row, 12, 0, 1, 2)
+        baseline_layout.addLayout(analysis_export_row, 7, 0, 1, 2)
 
         audit_row = QHBoxLayout()
         compare_btn = QPushButton("반복 baseline 비교")
@@ -1628,22 +1688,26 @@ class MainWindow(QMainWindow):
         audit_row.addWidget(compare_btn)
         audit_row.addWidget(integration_btn)
         audit_row.addWidget(bundle_btn)
-        layout.addLayout(audit_row, 13, 0, 1, 2)
+        baseline_layout.addLayout(audit_row, 8, 0, 1, 2)
 
-        layout.addWidget(QLabel("Histogram 대상 채널:"), 14, 0)
+        layout.addWidget(CollapsibleSection(
+            "Baseline 분석 및 내보내기", baseline_analysis, expanded=False,
+        ), 5, 0, 1, 2)
+
+        layout.addWidget(QLabel("Histogram 대상 채널:"), 6, 0)
         self.hist_channel_combo = QComboBox()
         self.hist_channel_combo.addItems(HIST_CHANNELS)
         self.hist_channel_combo.setCurrentText("Frequency (Hz)")
-        layout.addWidget(self.hist_channel_combo, 14, 1)
+        layout.addWidget(self.hist_channel_combo, 6, 1)
 
         note = QLabel("※ 공진 주파수 노이즈를 보려면 Frequency를 선택하세요 (Amplitude 아님).")
         note.setStyleSheet("color: gray; font-size: 10px;")
         note.setWordWrap(True)
-        layout.addWidget(note, 15, 0, 1, 2)
+        layout.addWidget(note, 7, 0, 1, 2)
 
         self.plotter_std_label = QLabel("Std: -")
         self.plotter_std_label.setStyleSheet("font-weight: bold;")
-        layout.addWidget(self.plotter_std_label, 16, 0, 1, 2)
+        layout.addWidget(self.plotter_std_label, 8, 0, 1, 2)
 
         save_plotter_btn = QPushButton("전체 세션 CSV로 저장")
         save_plotter_btn.setToolTip(
@@ -1651,7 +1715,7 @@ class MainWindow(QMainWindow):
             "시작한 뒤로 지금까지의 전체 기록을 저장합니다."
         )
         save_plotter_btn.clicked.connect(self.export_plotter_csv)
-        layout.addWidget(save_plotter_btn, 17, 0, 1, 2)
+        layout.addWidget(save_plotter_btn, 9, 0, 1, 2)
 
         return g
 
@@ -2024,6 +2088,9 @@ class MainWindow(QMainWindow):
         self.peak_markers.setData([], [])
         self.peak_list.clear()
         self._peak_candidates = []
+        self.last_resonance_fit = None
+        self.pll_calibrated_slope = None
+        self.pll_calibrated_setpoint = None
         self.tabs.setCurrentIndex(0)
 
         settings = {
@@ -2100,20 +2167,20 @@ class MainWindow(QMainWindow):
     def detect_peaks(self, freqs, R, theta):
         if len(R) < 5:
             return
-        prominence = 0.05 * (np.max(R) - np.min(R) + 1e-12)
-        idx, props = find_peaks(R, prominence=prominence)
+        idx, fwhm_values, _, noise_sigma = detect_resonance_peaks(freqs, R)
         self.peak_list.clear()
         if len(idx) == 0:
-            self.peak_list.addItem("피크를 찾지 못했습니다. 스윕 범위나 진폭을 조정해보세요.")
+            self.peak_list.addItem(
+                f"유효 피크를 찾지 못했습니다 (진폭 noise σ≈{noise_sigma:.3g} V). "
+                "평균/정착시간을 늘리거나 스윕 범위를 좁혀보세요."
+            )
             self.peak_markers.setData([], [])
             self._peak_candidates = []
             return
-        widths, _, _, _ = peak_widths(R, idx, rel_height=0.5)
-        df = freqs[1] - freqs[0] if len(freqs) > 1 else 1.0
         self._peak_candidates = []
         for k, i in enumerate(idx):
             f0 = freqs[i]
-            fwhm = widths[k] * abs(df)
+            fwhm = fwhm_values[k]
             q = f0 / fwhm if fwhm > 0 else float("nan")
             phase0 = theta[i]
             self._peak_candidates.append((f0, R[i], q, phase0))
@@ -2274,15 +2341,35 @@ class MainWindow(QMainWindow):
             if show_msg:
                 QMessageBox.warning(self, "복소 fitting 실패", fit.message)
             return None
-        self.last_resonance_fit = fit
         display_f = self.sweep_freqs[mask]
         z_fit = model_response(display_f, fit.parameters, float(np.mean(display_f)))
         self.sweep_fit_amp_curve.setData(display_f, np.abs(z_fit))
         self.sweep_fit_phase_curve.setData(display_f, np.angle(z_fit, deg=True))
+        quality = assess_fit_quality(
+            display_f, self.sweep_X[mask], self.sweep_Y[mask], fit,
+        )
+        quality_text = (
+            f"R²={quality.complex_r_squared:.3f}, "
+            f"선폭점={quality.linewidth_bins:.2f}"
+        )
+        if not quality.accepted:
+            self.last_resonance_fit = None
+            reason_text = "\n".join(f"• {reason}" for reason in quality.reasons)
+            self.fit_result_label.setText(
+                f"Fitting 거부: f0={fit.f0_hz:,.5f} Hz, Q={fit.q:,.2f}, "
+                f"Γ={fit.linewidth_hz:.4g} Hz, {quality_text}"
+            )
+            if show_msg:
+                QMessageBox.warning(
+                    self, "복소 fitting 품질 부족",
+                    "수치 최적화는 끝났지만 PLL에 사용할 수 없는 결과입니다.\n\n" + reason_text,
+                )
+            return None
+        self.last_resonance_fit = fit
         self.fit_result_label.setText(
             f"Fitting: f0={fit.f0_hz:,.5f}±{fit.f0_std_hz:.3g} Hz, "
             f"Q={fit.q:,.2f}±{fit.q_std:.2g}, Γ={fit.linewidth_hz:.4g} Hz, "
-            f"dφ/df={fit.phase_slope_deg_per_hz:.4g} deg/Hz, χ²ν={fit.reduced_chi2:.3g} "
+            f"dφ/df={fit.phase_slope_deg_per_hz:.4g} deg/Hz, {quality_text} "
             f"(selected window ±{half_window:.3g} Hz)"
         )
         if show_msg:
@@ -2459,12 +2546,26 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "PID 최적화 실패", str(e))
             return
+        slope_source = "실제 PLL detector 보정" if self.pll_calibrated_slope is not None else "DEMODS/0 fitting (보정 필요)"
+        if not design.stable:
+            self.pll_design_label.setText(
+                f"PID 설계 거부: 계산 BW={design.achieved_bandwidth_hz:.3g} Hz, "
+                f"PM={design.phase_margin_deg:.1f}°, GM={design.gain_margin_db:.1f} dB, "
+                f"Ms={design.sensitivity_peak:.3g}; {slope_source}; {design.message}"
+            )
+            QMessageBox.warning(
+                self, "불안정 PID 결과 적용 안 함",
+                self.pll_design_label.text() +
+                "\n\n기존 P/I/D 값은 변경하지 않았습니다. 현재처럼 Target BW=3 Hz, "
+                "TC=0.002 s, order=2인 조합에서는 먼저 TC를 늘리거나 실제 PLL detector 보정과 "
+                "P-only sign test를 수행하세요.",
+            )
+            return
         sign = -1.0 if self.pll_invert_sign_check.isChecked() else 1.0
         self.pll_p_spin.setValue(sign * design.p_hz_per_deg)
         self.pll_i_spin.setValue(sign * design.i_hz2_per_deg)
         self.pll_d_spin.setValue(sign * design.d_per_deg)
         status = "안정" if design.stable else "경고"
-        slope_source = "실제 PLL detector 보정" if self.pll_calibrated_slope is not None else "DEMODS/0 fitting (보정 권장)"
         self.pll_design_label.setText(
             f"PID 설계 ({status}): BW={design.achieved_bandwidth_hz:.3g} Hz, "
             f"PM={design.phase_margin_deg:.1f}°, GM={design.gain_margin_db:.1f} dB, "
@@ -2568,6 +2669,13 @@ class MainWindow(QMainWindow):
                 self.pll_rail_count = 0
             if self.pll_rail_count >= 3:
                 self.pll_enable_btn.setChecked(False)
+                try:
+                    # Disabling the HF2 PLL freezes the oscillator at its
+                    # last value.  Explicitly return from the capture-range
+                    # edge to the fitted/selected center for safe recovery.
+                    self.hf.set_frequency(self.pll_center_spin.value())
+                except Exception:
+                    pass
                 QMessageBox.warning(
                     self, "PLL 자동 해제",
                     "PLL 주파수 보정이 capture range 끝에 3회 연속 도달했습니다.\n"

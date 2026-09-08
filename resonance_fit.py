@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.optimize import least_squares
+from scipy.signal import find_peaks, peak_widths, savgol_filter
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,87 @@ class ResonanceFit:
     success: bool
     message: str
     parameters: np.ndarray
+
+
+@dataclass(frozen=True)
+class ResonanceFitQuality:
+    accepted: bool
+    linewidth_bins: float
+    normalized_rmse: float
+    complex_r_squared: float
+    reasons: tuple
+
+
+def detect_resonance_peaks(frequency_hz, amplitude):
+    """Detect resonance envelopes without treating point noise as resonances.
+
+    Peak finding on the raw trace is unstable when a sweep contains only one
+    sample per frequency.  A short Savitzky-Golay trend is used only for peak
+    detection and the raw complex samples remain untouched for fitting.
+    """
+    f = np.asarray(frequency_hz, dtype=float)
+    r = np.asarray(amplitude, dtype=float)
+    if len(r) < 5 or len(f) != len(r):
+        return np.array([], dtype=int), np.array([], dtype=float), r.copy(), np.nan
+
+    # Roughly 2 % of the trace suppresses isolated samples while preserving
+    # the much wider mechanical resonance envelope.  Keep the window odd.
+    window = max(5, int(round(len(r) * 0.02)))
+    if window % 2 == 0:
+        window += 1
+    window = min(window, len(r) if len(r) % 2 else len(r) - 1)
+    smooth = savgol_filter(r, window_length=window, polyorder=min(2, window - 1), mode="interp")
+    residual = r - smooth
+    median = float(np.median(residual))
+    noise_sigma = float(1.4826 * np.median(np.abs(residual - median)))
+    smooth_range = float(np.ptp(smooth))
+    prominence = max(0.03 * smooth_range, 5.0 * noise_sigma, np.finfo(float).eps)
+    indices, _ = find_peaks(smooth, prominence=prominence, distance=max(2, window // 2))
+    if len(indices) == 0:
+        return indices, np.array([], dtype=float), smooth, noise_sigma
+
+    widths, _, _, _ = peak_widths(smooth, indices, rel_height=0.5)
+    spacing = float(np.median(np.diff(np.sort(f)))) if len(f) > 1 else 1.0
+    return indices, widths * abs(spacing), smooth, noise_sigma
+
+
+def assess_fit_quality(frequency_hz, x, y, fit, min_linewidth_bins=3.0,
+                       min_complex_r_squared=0.80):
+    """Return conservative diagnostics for using a fit in PLL design."""
+    f = np.asarray(frequency_hz, dtype=float)
+    z = np.asarray(x, dtype=float) + 1j * np.asarray(y, dtype=float)
+    valid = np.isfinite(f) & np.isfinite(z.real) & np.isfinite(z.imag)
+    f, z = f[valid], z[valid]
+    if len(f) < 2:
+        return ResonanceFitQuality(False, 0.0, np.inf, -np.inf,
+                                   ("유효 측정점이 부족합니다.",))
+
+    spacing = float(np.median(np.diff(np.unique(np.sort(f)))))
+    linewidth_bins = float(fit.linewidth_hz / spacing) if spacing > 0 else 0.0
+    model = model_response(f, fit.parameters, float(np.mean(f)))
+    residual_power = float(np.sum(np.abs(model - z) ** 2))
+    signal_power = float(np.sum(np.abs(z - np.mean(z)) ** 2))
+    normalized_rmse = float(np.sqrt(residual_power / max(signal_power, np.finfo(float).tiny)))
+    complex_r_squared = float(1.0 - residual_power / max(signal_power, np.finfo(float).tiny))
+
+    reasons = []
+    if linewidth_bins < min_linewidth_bins:
+        target_step = fit.linewidth_hz / 5.0
+        reasons.append(
+            f"선폭 {fit.linewidth_hz:.3g} Hz가 스윕 간격 {spacing:.3g} Hz로 해상되지 않습니다 "
+            f"({linewidth_bins:.2f} points/FWHM; 권장 간격 ≤{target_step:.3g} Hz)."
+        )
+    if not np.isfinite(complex_r_squared) or complex_r_squared < min_complex_r_squared:
+        reasons.append(
+            f"복소 적합도 R²={complex_r_squared:.3f}가 기준 {min_complex_r_squared:.2f}보다 낮습니다."
+        )
+    if not np.isfinite(fit.q_std) or fit.q_std > 0.5 * fit.q:
+        reasons.append("Q 불확도가 50%보다 크거나 계산되지 않았습니다.")
+    if not np.isfinite(fit.f0_std_hz) or fit.f0_std_hz > 0.5 * fit.linewidth_hz:
+        reasons.append("중심주파수 불확도가 선폭에 비해 너무 큽니다.")
+
+    return ResonanceFitQuality(not reasons, linewidth_bins, normalized_rmse,
+                               complex_r_squared, tuple(reasons))
 
 
 def model_response(frequency_hz, parameters, center_hz=None):
