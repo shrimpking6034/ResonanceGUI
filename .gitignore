@@ -28,3 +28,7 @@ Noise Data/
 raw_*.csv
 events_*.csv
 integration_*.json
+
+# Particle review generated exports
+particle_graphs_*/
+raw_*_review.json
