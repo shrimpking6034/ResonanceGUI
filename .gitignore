@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 비밀 설정
+.env
+.env.*
+!.env.example
+
+# 빌드 결과
+.build/
+.dist/
+build/
+dist/
+*.exe
+*.pkg
+
+# 임시 파일
+.codex_tmp/
+.chart-data-*/
+tmp/
+outputs/
+
+# 실험 및 측정 데이터
+Noise Data/
+raw_*.csv
+events_*.csv
+integration_*.json
