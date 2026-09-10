@@ -9,6 +9,9 @@ from PyQt5 import QtCore, QtWidgets, QtGui
 import pyqtgraph as pg
 import pyqtgraph.exporters
 from particle_review_core import Settings, load_raw, pressure_changes, detect, local_baseline, manual_event, settings_dict, batch_context_noise
+from particle_review_noise import analyze_noise
+from particle_review_noise_gui import NoisePanel
+from particle_review_core import sample_window_stats
 
 
 class Worker(QtCore.QThread):
@@ -48,7 +51,7 @@ class ReviewWindow(QtWidgets.QMainWindow):
         self.data=None; self.path=None; self.events=[]; self.thresholds=[]; self.worker=None
         self.metadata={}; self.last_settings=None; self._editing=False
         self.removed_stack=[]; self.figure_worker=None
-        self.noise_window=self.spin(1.0,.1,120); self.noise_guard=self.spin(.10,0,30); self.noise_degree=QtWidgets.QComboBox(); self.noise_degree.addItems(['1 (선형 drift)','2 (완만한 곡률)'])
+        self.noise_window=self.spin(1.0,.1,120); self.noise_guard=self.spin(.25,0,30); self.noise_degree=QtWidgets.QComboBox(); self.noise_degree.addItems(['1 (선형 drift)','2 (완만한 곡률)'])
         pg.setConfigOptions(background='w', foreground='#263344', antialias=False)
         root=QtWidgets.QWidget(); self.setCentralWidget(root)
         layout=QtWidgets.QVBoxLayout(root)
@@ -90,13 +93,18 @@ class ReviewWindow(QtWidgets.QMainWindow):
         keep=QtWidgets.QPushButton('검토 상태로 남기기'); keep.clicked.connect(self.keep_status); actions.addWidget(keep)
         self.undo_btn=QtWidgets.QPushButton('제거 취소'); self.undo_btn.setEnabled(False); self.undo_btn.clicked.connect(self.undo_remove); actions.addWidget(self.undo_btn)
         self.batch_btn=QtWidgets.QPushButton('남은 후보 그래프 전체 저장'); self.batch_btn.clicked.connect(self.export_all_plots); ll.addWidget(self.batch_btn)
-        noise_box=QtWidgets.QGroupBox('후보 전후 주파수 noise 정량화'); nf=QtWidgets.QFormLayout(noise_box); ll.addWidget(noise_box)
+        noise_box=QtWidgets.QGroupBox('후보 전후 주파수 노이즈 / SNR'); nf=QtWidgets.QFormLayout(noise_box); ll.addWidget(noise_box)
         nf.addRow('각 방향 구간 길이 (s)',self.noise_window); nf.addRow('후보 제외 guard (s)',self.noise_guard); nf.addRow('drift 모델',self.noise_degree)
-        self.noise_btn=QtWidgets.QPushButton('남은 후보 전후 noise 계산·저장'); self.noise_btn.clicked.connect(self.calculate_context_noise); nf.addRow(self.noise_btn)
+        self.noise_btn=QtWidgets.QPushButton('남은 후보 노이즈 + SNR 계산'); self.noise_btn.clicked.connect(self.calculate_context_noise); nf.addRow(self.noise_btn)
         manual=QtWidgets.QHBoxLayout(); ll.addLayout(manual)
         self.manual_time=self.spin(0); manual.addWidget(self.manual_time)
         btn=QtWidgets.QPushButton('시각으로 수동 후보 추가'); btn.clicked.connect(self.add_manual); manual.addWidget(btn)
-        right=QtWidgets.QWidget(); rl=QtWidgets.QVBoxLayout(right); split.addWidget(right)
+        self.right_tabs=QtWidgets.QTabWidget(); split.addWidget(self.right_tabs)
+        right=QtWidgets.QWidget(); rl=QtWidgets.QVBoxLayout(right); self.right_tabs.addTab(right,'입자 파형 검토')
+        self.noise_panel=NoisePanel(self); self.right_tabs.addTab(self.noise_panel,'노이즈 / SNR')
+        self.noise_window.valueChanged.connect(self.noise_panel.invalidate)
+        self.noise_guard.valueChanged.connect(self.noise_panel.invalidate)
+        self.noise_degree.currentIndexChanged.connect(self.noise_panel.invalidate)
         self.overview=pg.PlotWidget(); self.overview.setLabel('left','Frequency',units='Hz'); self.overview.setLabel('bottom','Time',units='s')
         self.overview.getAxis('left').enableAutoSIPrefix(False)
         self.overview.setMaximumHeight(220); rl.addWidget(self.overview)
@@ -108,6 +116,14 @@ class ReviewWindow(QtWidgets.QMainWindow):
         detailbar.addWidget(QtWidgets.QLabel('후보 클릭 또는 위 선택 구간 이동 / 휠 확대 / 우클릭 축 메뉴'))
         self.span=self.spin(1.4,.1,120); self.span.valueChanged.connect(self.select_event); detailbar.addWidget(QtWidgets.QLabel('확대 폭(s)')); detailbar.addWidget(self.span)
         self.residual=QtWidgets.QCheckBox('국소 배경 제거'); self.residual.toggled.connect(self.select_event); detailbar.addWidget(self.residual)
+        samplebar=QtWidgets.QHBoxLayout(); rl.addLayout(samplebar)
+        self.sample_start=self.spin(0); self.sample_end=self.spin(.2)
+        for spin in (self.sample_start,self.sample_end):spin.setDecimals(7); spin.setSingleStep(.001)
+        samplebar.addWidget(QtWidgets.QLabel('표본 계산 구간(s)')); samplebar.addWidget(self.sample_start); samplebar.addWidget(QtWidgets.QLabel('~')); samplebar.addWidget(self.sample_end)
+        self.sample_visible=QtWidgets.QCheckBox('구간 표시'); self.sample_visible.setChecked(True); samplebar.addWidget(self.sample_visible)
+        sample_all=QtWidgets.QPushButton('현재 화면 범위'); sample_all.clicked.connect(self.sample_use_view); samplebar.addWidget(sample_all)
+        sample_save=QtWidgets.QPushButton('표본 통계 저장'); sample_save.clicked.connect(self.export_sample_stats); samplebar.addWidget(sample_save)
+        self.sample_info=QtWidgets.QLabel(); self.sample_info.setWordWrap(True); rl.addWidget(self.sample_info)
         self.graph=pg.GraphicsLayoutWidget(); rl.addWidget(self.graph,1)
         self.plots=[]
         for i,label in enumerate(['Frequency (Hz)','Phase (deg)','Amplitude (mV)','Pressure command (V)']):
@@ -116,6 +132,13 @@ class ReviewWindow(QtWidgets.QMainWindow):
             if i:p.setXLink(self.plots[0])
             self.plots.append(p)
         self.plots[-1].setLabel('bottom','Time',units='s')
+        self.sample_region=pg.LinearRegionItem([0,.2],brush=(30,160,170,35),pen=pg.mkPen('#159ca6'))
+        self.sample_region.setZValue(30)
+        self.sample_region.sigRegionChanged.connect(self.sample_region_changed)
+        self.sample_start.valueChanged.connect(self.sample_spins_changed)
+        self.sample_end.valueChanged.connect(self.sample_spins_changed)
+        self.sample_visible.toggled.connect(self.sample_region.setVisible)
+        self.plots[0].sigXRangeChanged.connect(self.update_sample_stats)
         self.plots[0].scene().sigMouseClicked.connect(self.graph_click)
         self.detail_note=QtWidgets.QLabel(); self.detail_note.setWordWrap(True); rl.addWidget(self.detail_note)
         split.setSizes([610,940]); self.statusBar().showMessage('장비 연결 없이 CSV만 분석합니다.')
@@ -136,6 +159,9 @@ class ReviewWindow(QtWidgets.QMainWindow):
         try:d,metadata=load_raw(path)
         except Exception as exc:self.error(str(exc)); return
         self.data=d; self.path=Path(path).resolve(); self.metadata=metadata; self.events=[]; self.thresholds=[]; self.last_settings=None
+        self.sample_times=d.Time_s.to_numpy()
+        self.sample_region.setBounds([float(d.Time_s.iloc[0]),float(d.Time_s.iloc[-1])])
+        self.sample_region.setRegion([float(d.Time_s.iloc[0]),min(float(d.Time_s.iloc[-1]),float(d.Time_s.iloc[0])+.2)])
         self.removed_stack.clear(); self.undo_btn.setEnabled(False)
         self.path_label.setText(self.path.name)
         t=d.Time_s.to_numpy(); self.start.setValue(t[0]); self.end.setValue(t[-1])
@@ -179,6 +205,7 @@ class ReviewWindow(QtWidgets.QMainWindow):
         if events:self.table.selectRow(0)
 
     def refresh_table(self):
+        self.noise_panel.invalidate()
         self._editing=True; self.table.setRowCount(len(self.events))
         for row,e in enumerate(self.events):
             values=[e['time_s'],e['depth_hz'],e['width_s'],e['contrast_hz'],e['pressure_delay_s'],e['family'],e['status'],e['note']]
@@ -197,12 +224,14 @@ class ReviewWindow(QtWidgets.QMainWindow):
     def edit_event(self,item):
         if not self._editing and item.column()>=6:
             self.events[item.row()]['status' if item.column()==6 else 'note']=item.text()
+            self.noise_panel.invalidate()
 
     def select_event(self,*args):
         if self._editing:return
         row=self.table.currentRow()
         if not 0<=row<len(self.events):return
         center=self.events[row]['time_s']; self.manual_time.setValue(center)
+        self.sample_region.setRegion([center-.1,center+.1])
         self.region.setRegion([center-self.span.value()/2,center+self.span.value()/2]); self.draw_detail()
 
     def marker_clicked(self,item,points,*args):
@@ -221,6 +250,8 @@ class ReviewWindow(QtWidgets.QMainWindow):
         lo,hi=self.region.getRegion(); d=self.data; t=d.Time_s.to_numpy()
         mask=(t>=lo)&(t<=hi)
         for p in self.plots:p.clear()
+        self.plots[0].addItem(self.sample_region)
+        self.sample_region.setVisible(self.sample_visible.isChecked())
         f=d.Frequency_Hz.to_numpy(); baseline=None; center=self.manual_time.value()
         if self.residual.isChecked():
             try:baseline=local_baseline(d,center)
@@ -235,6 +266,41 @@ class ReviewWindow(QtWidgets.QMainWindow):
         self.plots[0].setXRange(lo,hi,padding=0)
         for p in self.plots:p.enableAutoRange(axis='y')
         self.detail_note.setText('압력 명령: A=녹색 / B=빨강 · 회색 점선=명령 변경\n검토·메모 열은 직접 수정 가능 (예: 후보 유지, 제외, 불확실). 그래프 더블클릭으로 수동 시각 선택.')
+        self.update_sample_stats()
+
+    def sample_region_changed(self):
+        lo,hi=self.sample_region.getRegion()
+        for spin,value in [(self.sample_start,lo),(self.sample_end,hi)]:
+            spin.blockSignals(True); spin.setValue(value); spin.blockSignals(False)
+        self.update_sample_stats()
+
+    def sample_spins_changed(self):
+        self.sample_region.setRegion(sorted((self.sample_start.value(),self.sample_end.value())))
+
+    def sample_use_view(self):
+        if self.data is not None:self.sample_region.setRegion(self.plots[0].viewRange()[0])
+
+    def update_sample_stats(self,*args):
+        if self.data is None:return
+        stats=sample_window_stats(self.sample_times,*self.sample_region.getRegion())
+        shown=sample_window_stats(self.sample_times,*self.plots[0].viewRange()[0])
+        text=f"선택 구간: {stats['sample_count']:,}개 / {stats['window_duration_s']*1000:.3f} ms"
+        if np.isfinite(stats['sampling_rate_hz']):
+            text+=f" · 중앙 간격 {stats['median_interval_s']*1000:.4f} ms · {stats['sampling_rate_hz']:,.1f} Sa/s · 최대 간격 {stats['max_interval_s']*1000:.4f} ms"
+        text+=f"\n현재 화면: {shown['sample_count']:,}개 · 청록색 양 끝을 드래그해 실제 이벤트 범위를 지정하세요."
+        if stats['large_gap_count']:text+=f" 간격 >1.5배: {stats['large_gap_count']}곳"
+        self.sample_info.setText(text)
+
+    def export_sample_stats(self):
+        if self.data is None:return
+        path,_=QtWidgets.QFileDialog.getSaveFileName(self,'선택 구간 원시 표본 통계',str(self.path.with_name(self.path.stem+'_sample_stats.csv')),'CSV (*.csv)')
+        if not path:return
+        if Path(path).resolve()==self.path:self.error('원본 CSV에는 덮어쓸 수 없습니다.');return
+        try:
+            stats=sample_window_stats(self.sample_times,*self.sample_region.getRegion())
+            pd.DataFrame([dict(source=str(self.path),**stats)]).to_csv(path,index=False,encoding='utf-8-sig')
+            self.statusBar().showMessage(f'선택 구간 표본 통계 저장: {path}')
+        except Exception as exc:self.error(str(exc))
 
     def graph_click(self,event):
         if event.double() and self.plots[0].sceneBoundingRect().contains(event.scenePos()):
@@ -288,6 +354,7 @@ class ReviewWindow(QtWidgets.QMainWindow):
         try:
             pd.DataFrame(self.events).to_csv(target,index=False,encoding='utf-8-sig')
             info=dict(source=str(self.path),settings=settings_dict(self.last_settings) if self.last_settings else None,metadata=self.metadata,thresholds=self.thresholds,pressure_changes=self.changes.to_dict('records'),sample_count=len(self.data),time_start=float(self.data.Time_s.iloc[0]),time_end=float(self.data.Time_s.iloc[-1]),note='탐색 후보이며 입자 확정/검출한계가 아닙니다.')
+            info['noise_settings']=self.get_noise_settings()
             target.with_suffix('.json').write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding='utf-8')
             self.statusBar().showMessage(f'저장 완료: {target}')
         except Exception as exc:self.error(str(exc))
@@ -295,19 +362,14 @@ class ReviewWindow(QtWidgets.QMainWindow):
     def calculate_context_noise(self):
         if self.data is None or not self.events:self.error('전후 noise를 계산할 후보가 없습니다.');return
         try:
-            degree=1 if self.noise_degree.currentIndex()==0 else 2
-            result=batch_context_noise(self.data,self.events,self.noise_window.value(),self.noise_guard.value(),degree)
-            path,_=QtWidgets.QFileDialog.getSaveFileName(self,'전후 noise 결과 저장',str(self.path.with_name(self.path.stem+'_context_noise.csv')),'CSV (*.csv)')
-            if not path:return
-            target=Path(path)
-            if target.resolve()==self.path:self.error('원본 CSV에는 덮어쓸 수 없습니다.');return
-            result.to_csv(target,index=False,encoding='utf-8-sig')
-            summary=(result.groupby('context')[['mean_frequency_hz','raw_std_hz','detrended_std_hz','peak_to_peak_residual_hz','threshold_10sigma_hz']].agg(['mean','median','min','max']).reset_index())
-            meta=dict(source=str(self.path),event_count=len(self.events),window_s=self.noise_window.value(),guard_s=self.noise_guard.value(),detrend_degree=degree,definition='frequency noise = detrended standard deviation in equal before/after windows; no smoothing/interpolation',summary=summary.to_dict('records'))
-            target.with_suffix('.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
-            self.statusBar().showMessage(f'전후 noise {len(self.events)}개 후보 × 2구간 저장: {target}')
-            self.show_noise_summary(result)
+            result=analyze_noise(self.data,self.events,**self.get_noise_settings())
+            self.noise_panel.set_result(result,self.data,self.path,deepcopy(self.metadata))
+            self.right_tabs.setCurrentWidget(self.noise_panel)
+            self.statusBar().showMessage('노이즈 / SNR 계산 완료. 표의 행을 선택해 제외 구간을 확인하고 결과를 저장하세요.')
         except Exception as exc:self.error(str(exc))
+
+    def get_noise_settings(self):
+        return dict(window_s=self.noise_window.value(),guard_s=self.noise_guard.value(),degree=self.noise_degree.currentIndex()+1)
 
     def show_noise_summary(self,result):
         rows=[]
@@ -321,8 +383,14 @@ class ReviewWindow(QtWidgets.QMainWindow):
         if not path:return
         try:
             info=json.loads(Path(path).with_suffix('.json').read_text(encoding='utf-8'))
-            if Path(info['source']).resolve()!=self.path:
-                raise ValueError('검토 파일의 원본 경로가 현재 파일과 다릅니다. 기록된 원본 CSV를 먼저 여세요.')
+            saved_source=Path(info['source']).resolve()
+            if saved_source!=self.path:
+                relocated=(not saved_source.exists() and saved_source.name==self.path.name
+                    and info.get('sample_count')==len(self.data)
+                    and np.isclose(info.get('time_start',np.nan),self.data.Time_s.iloc[0],rtol=0,atol=1e-6)
+                    and np.isclose(info.get('time_end',np.nan),self.data.Time_s.iloc[-1],rtol=0,atol=1e-6))
+                if not relocated:
+                    raise ValueError('검토 파일의 원본 경로가 현재 파일과 다릅니다. 기록된 원본 CSV를 먼저 여세요.')
             if info.get('sample_count',len(self.data))!=len(self.data):raise ValueError('원본의 표본 수가 저장 당시와 다릅니다.')
             try:table=pd.read_csv(path,encoding='utf-8-sig')
             except pd.errors.EmptyDataError:table=pd.DataFrame()
@@ -335,9 +403,12 @@ class ReviewWindow(QtWidgets.QMainWindow):
             self.events=loaded; self.thresholds=info.get('thresholds',[])
             self.removed_stack.clear(); self.undo_btn.setEnabled(False)
             self.last_settings=Settings(**info['settings']) if info.get('settings') else None
+            ns=info.get('noise_settings')
+            if ns:
+                self.noise_window.setValue(ns.get('window_s',1.0)); self.noise_guard.setValue(ns.get('guard_s',.25)); self.noise_degree.setCurrentIndex(ns.get('degree',1)-1)
             self.refresh_table(); self.update_meta()
             if loaded:self.table.selectRow(0)
-            self.statusBar().showMessage('저장된 검토 목록을 불러왔습니다.')
+            self.statusBar().showMessage('저장된 검토 목록을 불러왔습니다.' if saved_source==self.path else '이동된 원본: 파일명·표본 수·시간 범위가 일치하여 검토 목록을 불러왔습니다.')
         except Exception as exc:self.error(str(exc))
 
     def export_plot(self):
@@ -352,7 +423,7 @@ class ReviewWindow(QtWidgets.QMainWindow):
         if self.worker is not None and self.worker.isRunning():self.error('자동 분석이 끝난 뒤 저장하세요.');return
         parent=QtWidgets.QFileDialog.getExistingDirectory(self,f'남은 {len(self.events)}행의 그래프 저장 위치 (확대 폭 {self.span.value():g}초)',str(self.path.parent))
         if not parent:return
-        self.figure_worker=FigureExportWorker(self.data,self.events,parent,self.path,self.span.value(),self.residual.isChecked(),settings_dict(self.last_settings) if self.last_settings else None,dict(metadata=self.metadata,thresholds=self.thresholds))
+        self.figure_worker=FigureExportWorker(self.data,self.events,parent,self.path,self.span.value(),self.residual.isChecked(),settings_dict(self.last_settings) if self.last_settings else None,dict(metadata=self.metadata,thresholds=self.thresholds,noise_settings=self.get_noise_settings()))
         self.export_progress=QtWidgets.QProgressDialog('후보별 주파수·위상·진폭·압력 그래프 저장 중…','중단',0,len(self.events),self)
         self.export_progress.setWindowTitle('남은 후보 그래프 일괄 저장')
         self.export_progress.setWindowModality(QtCore.Qt.ApplicationModal)
@@ -374,7 +445,9 @@ class ReviewWindow(QtWidgets.QMainWindow):
         self.export_progress.close(); self.error(message)
 
     def closeEvent(self,event):
-        if self.figure_worker is not None and self.figure_worker.isRunning():
+        if self.noise_panel.save_worker is not None and self.noise_panel.save_worker.isRunning():
+            self.statusBar().showMessage('노이즈 / SNR 저장이 끝난 뒤 닫아주세요.'); event.ignore()
+        elif self.figure_worker is not None and self.figure_worker.isRunning():
             self.statusBar().showMessage('그래프 저장을 마치거나 중단한 뒤 닫아주세요.'); event.ignore()
         elif self.worker is not None and self.worker.isRunning():
             self.statusBar().showMessage('분석이 끝난 뒤 닫아주세요.'); event.ignore()

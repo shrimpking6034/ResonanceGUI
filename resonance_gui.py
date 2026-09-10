@@ -43,6 +43,7 @@ worker below therefore opens its own independent connection to the HF2
 Data Server rather than sharing the GUI-thread connection.
 """
 import csv
+from bisect import bisect_left
 import json
 import sys
 import os
@@ -103,7 +104,7 @@ HF2_DEMOD = 0                 # demodulator reading the sense piezo (for R/theta
 HF2_PLL = 0
 
 MAX_DRIVE_V = 10.0            # hard safety limit, HF2LI output feeds the piezo directly
-APP_VERSION = "2026.09.08.1"
+APP_VERSION = "2026.09.09.1"
 OUTPUT_RANGE_OPTIONS = [("10 mV", 0.01), ("100 mV", 0.1), ("1 V", 1.0), ("10 V", 10.0)]
 
 # Default to the NI-MAX alias used by the original control program.  Startup
@@ -1575,21 +1576,33 @@ class MainWindow(QMainWindow):
         g = QGroupBox("6. Plotter — 데이터 스트림 & Math(Histogram/Std)")
         layout = QGridLayout(g)
 
-        layout.addWidget(QLabel("저장 샘플 간격 (ms):"), 0, 0)
-        self.plotter_interval_spin = QSpinBox()
-        self.plotter_interval_spin.setRange(1, 2000)
-        self.plotter_interval_spin.setValue(10)
-        self.plotter_interval_spin.setToolTip(
-            "HF2 demodulator streaming rate를 설정합니다. 10 ms = 100 Hz. "
-            "화면은 별도로 약 20 Hz로 갱신됩니다."
+        layout.addWidget(QLabel("저장 샘플 속도 (Sa/s):"), 0, 0)
+        self.plotter_rate_spin = QDoubleSpinBox()
+        self.plotter_rate_spin.setRange(1.0, 7200.0)
+        self.plotter_rate_spin.setDecimals(1)
+        self.plotter_rate_spin.setSingleStep(900.0)
+        self.plotter_rate_spin.setValue(1800.0)
+        self.plotter_rate_spin.setSuffix(" Sa/s")
+        self.plotter_rate_spin.setToolTip(
+            "HF2 demodulator USB streaming rate를 직접 설정합니다. "
+            "권장 단계는 1800, 3600, 7200 Sa/s입니다. "
+            "장비가 지원하는 가장 가까운 분주값이 실제로 적용됩니다. "
+            "화면은 저장 속도와 무관하게 약 20 Hz로 갱신됩니다."
         )
-        layout.addWidget(self.plotter_interval_spin, 0, 1)
+        layout.addWidget(self.plotter_rate_spin, 0, 1)
 
-        layout.addWidget(QLabel("시간축 폭 (s):"), 1, 0)
+        self.plotter_actual_rate_label = QLabel("실제 적용: 시작 후 표시")
+        self.plotter_actual_rate_label.setToolTip(
+            "HF2LI는 요청값을 지원하는 분주 속도로 근사합니다. "
+            "CSV에는 요청 속도와 실제 속도가 모두 저장됩니다."
+        )
+        layout.addWidget(self.plotter_actual_rate_label, 1, 0, 1, 2)
+
+        layout.addWidget(QLabel("시간축 폭 (s):"), 2, 0)
         self.plotter_window_spin = QDoubleSpinBox()
         self.plotter_window_spin.setRange(0.5, 3600)
         self.plotter_window_spin.setValue(10.0)
-        layout.addWidget(self.plotter_window_spin, 1, 1)
+        layout.addWidget(self.plotter_window_spin, 2, 1)
 
         btn_row = QHBoxLayout()
         self.plotter_start_btn = QPushButton("Plotter 시작")
@@ -1599,17 +1612,17 @@ class MainWindow(QMainWindow):
         self.plotter_stop_btn.clicked.connect(self.stop_plotter)
         btn_row.addWidget(self.plotter_start_btn)
         btn_row.addWidget(self.plotter_stop_btn)
-        layout.addLayout(btn_row, 2, 0, 1, 2)
+        layout.addLayout(btn_row, 3, 0, 1, 2)
 
         self.baseline_start_btn = QPushButton("Baseline 테스트 시작 (입자/공압전환 비활성)")
         self.baseline_start_btn.setToolTip("연속 PLL tracking만 기록합니다. Ping-Pong 입자 감지와 자동 압력 전환은 실행되지 않습니다.")
         self.baseline_start_btn.clicked.connect(self.start_baseline_test)
-        layout.addWidget(self.baseline_start_btn, 3, 0, 1, 2)
+        layout.addWidget(self.baseline_start_btn, 4, 0, 1, 2)
 
         self.baseline_stop_btn = QPushButton("Baseline 테스트 중지")
         self.baseline_stop_btn.setEnabled(False)
         self.baseline_stop_btn.clicked.connect(self.stop_baseline_test)
-        layout.addWidget(self.baseline_stop_btn, 4, 0, 1, 2)
+        layout.addWidget(self.baseline_stop_btn, 5, 0, 1, 2)
 
         baseline_analysis = QWidget()
         baseline_layout = QGridLayout(baseline_analysis)
@@ -2710,9 +2723,9 @@ class MainWindow(QMainWindow):
             "SessionID": datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8],
             "Measurement_mode": "Baseline (PLL tracking only)" if baseline else "Tracking",
             "Measurement_start_timestamp_local": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "Plotter_requested_interval_ms": self.plotter_interval_spin.value(),
+            "Plotter_requested_interval_ms": 1000.0 / self.plotter_rate_spin.value(),
             "Acquisition_mode": "Buffered demod subscribe/poll; device timestamps",
-            "Demod_requested_rate_Hz": 1000.0 / self.plotter_interval_spin.value(),
+            "Demod_requested_rate_Hz": self.plotter_rate_spin.value(),
             "Plotter_GUI_refresh_rate_Hz": 20.0,
             "PLL_status_logging": "Cached low-rate PLLStatusWorker values; not read per demod sample",
             "PLL_update_rate_Hz": pll_rate,
@@ -2768,6 +2781,7 @@ class MainWindow(QMainWindow):
         self.baseline_analysis_result = None
         self.baseline_analysis_source = None
         self.plotter_actual_rate_hz = np.nan
+        self.plotter_actual_rate_label.setText("실제 적용: 연결 중...")
         self._last_plotter_ui_update_t = -np.inf
         self._last_baseline_ui_update_t = -np.inf
         self.measurement_metadata = self._capture_measurement_metadata(self.baseline_active)
@@ -2781,13 +2795,14 @@ class MainWindow(QMainWindow):
         self.baseline_stats_label.setText("Baseline 분석: 수집 중... (raw data, no software smoothing)")
         self.tabs.setCurrentIndex(3 if self.baseline_active else 2)
 
-        requested_rate_hz = 1000.0 / self.plotter_interval_spin.value()
+        requested_rate_hz = self.plotter_rate_spin.value()
         self.plotter_worker = PlotterWorker(
             requested_rate_hz, emit_period_s=0.05, timing_enabled=self.baseline_active
         )
         self.plotter_worker.batch_ready.connect(self.on_plotter_batch)
         self.plotter_worker.stream_started.connect(self.on_plotter_stream_started)
         self.plotter_worker.failed.connect(self.on_plotter_failed)
+        self.plotter_rate_spin.setEnabled(False)
         self.plotter_start_btn.setEnabled(False)
         self.plotter_stop_btn.setEnabled(True)
         self.baseline_start_btn.setEnabled(not self.baseline_active)
@@ -2802,6 +2817,7 @@ class MainWindow(QMainWindow):
             self.measurement_metadata["Measurement_end_timestamp_local"] = datetime.now().astimezone().isoformat(timespec="seconds")
             self.measurement_metadata["Received_sample_count"] = int(self.received_sample_count)
             self.measurement_metadata["Logged_row_count"] = int(len(self.log_t))
+        self.plotter_rate_spin.setEnabled(True)
         self.plotter_start_btn.setEnabled(True)
         self.plotter_stop_btn.setEnabled(False)
         self.baseline_start_btn.setEnabled(True)
@@ -2837,6 +2853,10 @@ class MainWindow(QMainWindow):
         self.plotter_actual_rate_hz = float(actual_rate_hz)
         self.measurement_metadata["Demod_stream_rate_Hz_actual"] = float(actual_rate_hz)
         self.measurement_metadata["Demod_stream_rate_Hz_requested"] = float(requested_rate_hz)
+        self.plotter_actual_rate_label.setText(
+            f"실제 적용: {actual_rate_hz:,.3f} Sa/s "
+            f"(요청 {requested_rate_hz:,.1f} Sa/s)"
+        )
 
     def on_plotter_batch(self, batch):
         """Record every streamed sample, but redraw the GUI only at 20 Hz."""
@@ -2902,13 +2922,16 @@ class MainWindow(QMainWindow):
         refresh_started = time.perf_counter()
         window = self.plotter_window_spin.value()
         cutoff = t - window
-        while self.plot_t and self.plot_t[0] < cutoff:
-            self.plot_t.pop(0)
-            self.plot_R.pop(0)
-            self.plot_theta.pop(0)
-            self.plot_f.pop(0)
-            self.plot_x.pop(0)
-            self.plot_y.pop(0)
+        # At multi-kSa/s rates, repeated pop(0) shifts the full list once per
+        # expired sample and can starve the GUI thread. Find the boundary once
+        # and remove the expired prefix from all display buffers in bulk.
+        expired = bisect_left(self.plot_t, cutoff)
+        if expired:
+            for values in (
+                self.plot_t, self.plot_R, self.plot_theta,
+                self.plot_f, self.plot_x, self.plot_y,
+            ):
+                del values[:expired]
 
         # Rendering hundreds of thousands of points at 20 Hz can dominate the
         # GUI thread.  Preserve the full display-window buffers for statistics,
@@ -2962,7 +2985,7 @@ class MainWindow(QMainWindow):
         nominal_interval_s = (
             1.0 / self.plotter_actual_rate_hz
             if np.isfinite(self.plotter_actual_rate_hz) and self.plotter_actual_rate_hz > 0
-            else self.plotter_interval_spin.value() / 1000.0
+            else 1.0 / self.plotter_rate_spin.value()
         )
         timing = timing_quality(t, nominal_interval_s)
         display_stride = max(1, n // 5000)
@@ -2986,7 +3009,7 @@ class MainWindow(QMainWindow):
         nominal_interval_s = (
             1.0 / self.plotter_actual_rate_hz
             if np.isfinite(self.plotter_actual_rate_hz) and self.plotter_actual_rate_hz > 0
-            else self.plotter_interval_spin.value() / 1000.0
+            else 1.0 / self.plotter_rate_spin.value()
         )
         self._run_baseline_analysis_source({
             "name": "current in-memory raw Plotter log", "metadata": dict(self.measurement_metadata),

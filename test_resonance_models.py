@@ -43,6 +43,30 @@ class ResonanceModelTests(unittest.TestCase):
         self.assertAlmostEqual(fit.f0_hz, 10000.0, places=3)
         self.assertAlmostEqual(fit.q, 1200.0, places=1)
 
+    def test_complex_fit_avoids_low_q_background_cancellation(self):
+        f = np.linspace(21112.449799196787, 21409.63855421687, 75)
+        parameters = np.array([
+            21259.0388, np.log(173.5078),
+            6.85996101e-6, -1.05540837e-6,
+            -1.94450147e-5, 9.75913344e-5,
+            8.22593608e-8, 4.82407594e-8,
+        ])
+        rng = np.random.default_rng(0)
+        z = model_response(f, parameters, np.mean(f))
+        z += (rng.normal(0.0, 8.4e-6, len(f))
+              + 1j * rng.normal(0.0, 8.4e-6, len(f)))
+        missing_sem = np.full(len(f), np.nan)
+
+        fit = fit_complex_resonance(
+            f, z.real, z.imag, missing_sem, missing_sem,
+            f0_guess=21261.0442, f0_bounds=(21148.5442, 21373.5442),
+        )
+        quality = assess_fit_quality(f, z.real, z.imag, fit)
+
+        self.assertAlmostEqual(fit.f0_hz, 21259.0388, delta=3.0)
+        self.assertGreater(fit.q, 50.0)
+        self.assertTrue(quality.accepted, quality.reasons)
+
     def test_constrained_fit_stays_on_selected_mode(self):
         f = np.linspace(9500, 10500, 1001)
         selected = np.array([9800.0, np.log(800.0), 0.35, 0.1, 0.0, 0.0, 0.0, 0.0])

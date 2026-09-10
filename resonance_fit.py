@@ -175,23 +175,38 @@ def fit_complex_resonance(frequency_hz, x, y, x_sem=None, y_sem=None,
         model = model_response(f, p, center)
         return np.concatenate(((model.real - z.real) / sx, (model.imag - z.imag) / sy))
 
-    # Q and the complex background are correlated.  Use several physically
-    # spaced Q seeds, then retain the lowest robust cost rather than trusting
-    # a single coarse FWHM estimate.
+    # Q and the complex background are correlated.  Starting a robust loss
+    # directly from a coarse seed can classify the resonance itself as an
+    # outlier.  In that failure mode Q collapses toward its lower bound while
+    # huge resonance/background terms cancel each other.  First locate the
+    # least-squares basin from several Q seeds, then robustly refine only the
+    # best physical basin.
     q_seeds = [q_guess, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0]
     x_scale = np.array([max(span, 1.0), 1.0,
                         amplitude_scale, amplitude_scale, amplitude_scale, amplitude_scale,
                         amplitude_scale / max(span, 1.0), amplitude_scale / max(span, 1.0)])
-    result = None
+    preliminary = None
     for q_seed in q_seeds:
         start = p0.copy()
         start[1] = np.clip(np.log(q_seed), lower[1] + 1e-12, upper[1] - 1e-12)
         candidate = least_squares(
-            residuals, start, bounds=(lower, upper), loss="soft_l1",
-            f_scale=max(amplitude_scale * 0.05, 1e-12), max_nfev=5000, x_scale=x_scale,
+            residuals, start, bounds=(lower, upper), loss="linear",
+            max_nfev=5000, x_scale=x_scale,
         )
-        if result is None or candidate.cost < result.cost:
-            result = candidate
+        if preliminary is None or candidate.cost < preliminary.cost:
+            preliminary = candidate
+
+    preliminary_residuals = residuals(preliminary.x)
+    residual_center = float(np.median(preliminary_residuals))
+    residual_sigma = float(
+        1.4826 * np.median(np.abs(preliminary_residuals - residual_center))
+    )
+    residual_rms = float(np.sqrt(np.mean(preliminary_residuals ** 2)))
+    robust_scale = max(residual_sigma, 0.05 * residual_rms, np.finfo(float).eps)
+    result = least_squares(
+        residuals, preliminary.x, bounds=(lower, upper), loss="soft_l1",
+        f_scale=robust_scale, max_nfev=5000, x_scale=x_scale,
+    )
     p = result.x
     q = float(np.exp(p[1]))
     model = model_response(f, p, center)

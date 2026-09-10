@@ -23,6 +23,24 @@ def robust_sigma(x):
     return float(1.4826 * np.median(np.abs(x - np.median(x))))
 
 
+def sample_window_stats(t, start_s, end_s):
+    """Count raw timestamps in the closed interval; no resampling or N=fs*T approximation."""
+    t=np.asarray(t,dtype=float)
+    lo,hi=sorted((float(start_s),float(end_s)))
+    if not np.isfinite([lo,hi]).all():raise ValueError('구간 경계는 유한한 숫자여야 합니다.')
+    left=int(np.searchsorted(t,lo,side='left')); right=int(np.searchsorted(t,hi,side='right'))
+    samples=t[left:right]; dt=np.diff(samples)
+    median=float(np.median(dt)) if len(dt) else np.nan
+    return dict(start_s=lo,end_s=hi,window_duration_s=hi-lo,sample_count=len(samples),
+                first_sample_s=float(samples[0]) if len(samples) else np.nan,
+                last_sample_s=float(samples[-1]) if len(samples) else np.nan,
+                sample_span_s=float(samples[-1]-samples[0]) if len(samples)>1 else np.nan,
+                median_interval_s=median,min_interval_s=float(np.min(dt)) if len(dt) else np.nan,
+                max_interval_s=float(np.max(dt)) if len(dt) else np.nan,
+                sampling_rate_hz=1/median if median>0 else np.nan,
+                large_gap_count=int(np.sum(dt>1.5*median)) if median>0 else 0)
+
+
 def load_raw(path):
     metadata = {}
     with open(path, encoding='utf-8-sig', newline='') as handle:
