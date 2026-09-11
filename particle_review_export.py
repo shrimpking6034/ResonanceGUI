@@ -57,9 +57,17 @@ def export_event_figures(data, events, parent, source, span, residual=False,
                 ax.grid(alpha=.2); ax.set_xlim(lo,hi)
                 ax.ticklabel_format(axis='both',style='plain',useOffset=False)
                 ax.axvline(center,color='#c85050',lw=.7,ls=':')
+                event_lo=float(event.get('event_start_s',center)); event_hi=float(event.get('event_end_s',center))
+                if np.isfinite([event_lo,event_hi]).all() and event_hi>event_lo:
+                    ax.axvspan(event_lo,event_hi,color='#159ca6',alpha=.10)
+                    ax.axvline(event_lo,color='#159ca6',lw=.7,ls='--')
+                    ax.axvline(event_hi,color='#159ca6',lw=.7,ls='--')
                 for change in changes[(changes>=lo)&(changes<=hi)]:ax.axvline(change,color='gray',ls='--',lw=.7)
             sample_stats=sample_window_stats(t,lo,hi)
-            heading=f'{Path(source).name}\n#{index:03d} | {center:.4f} s | {event.get("family", "")} | 검토: {event.get("status", "")} | 확대 폭 {span:g} s | 화면 표본 {sample_stats["sample_count"]:,}개'
+            duration=float(event.get('duration_s',0.))
+            heading=f'{Path(source).name}\n#{index:03d} | 대표 {center:.4f} s | 실제 구간 {duration*1000:.1f} ms | {event.get("family", "")} | 검토: {event.get("status", "")} | 확대 폭 {span:g} s | 화면 표본 {sample_stats["sample_count"]:,}개'
+            if np.isfinite(float(event.get('buoyant_mass_pg',np.nan))):
+                heading+=f'\n부유질량 {float(event["buoyant_mass_pg"]):,.1f} pg | 밀도 {float(event["density_nominal_kg_m3"]):,.1f} kg/m³ ({float(event["density_low_kg_m3"]):,.1f}–{float(event["density_high_kg_m3"]):,.1f})'
             note=str(event.get('note',''))
             if note:heading+='\n'+'\n'.join(textwrap.wrap('메모: '+note,width=90))
             fig.suptitle(heading,fontproperties=font,fontsize=10)
@@ -89,6 +97,8 @@ def export_event_figures(data, events, parent, source, span, residual=False,
         if review_context:
             metadata['metadata']=review_context.get('metadata',{})
             metadata['thresholds']=review_context.get('thresholds',[])
+            metadata['particle_property_settings']=review_context.get('particle_property_settings')
+            metadata['particle_property_calibration']=review_context.get('particle_property_calibration')
         if analysis is not None:
             metadata['noise_settings']=noise_settings
             metadata['context_noise_window_s']=noise_settings['window_s']

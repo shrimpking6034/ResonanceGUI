@@ -1,0 +1,13 @@
+﻿# Metadata,SessionID,20260911_173432_1527810c
+# Metadata,Mounting_condition,nylon-tip / direct piezo
+# Metadata,Clamp_torque_contact,
+# Metadata,Fluid,DI water
+# Metadata,Triton_concentration,0.02
+# Metadata,Triton_basis,unspecified
+# Metadata,Particle_material,SS
+# Metadata,Particle_size_min_um,130.0
+# Metadata,Particle_size_max_um,155.0
+# Metadata,Effective_travel_distance_mm,49.0
+f0_Hz,R_V,Q,Phase_deg
+4360.401002506265,0.0003661260117643784,377.56446912665086,-50.850336852035035
+4439.598997493735,0.001132623639860546,84.14140768919974,-115.1843088134966

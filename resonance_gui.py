@@ -52,6 +52,7 @@ import uuid
 from datetime import datetime
 
 import numpy as np
+import pandas as pd
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -75,6 +76,8 @@ from baseline_analysis import (timing_quality, linear_baseline, rolling_metrics,
                                evaluate_blank, poisson_rate_summary,
                                EVENT_WINDOWS_S, DETECTION_DURATIONS_S, ROLLING_WINDOWS_S)
 from experiment_analysis import compare_baselines, write_comparison, integration_diagnostics
+from particle_review_core import Settings as ParticleSettings
+from particle_review_core import calibrate_detector, detect_calibrated
 
 try:
     import nidaqmx
@@ -104,7 +107,7 @@ HF2_DEMOD = 0                 # demodulator reading the sense piezo (for R/theta
 HF2_PLL = 0
 
 MAX_DRIVE_V = 10.0            # hard safety limit, HF2LI output feeds the piezo directly
-APP_VERSION = "2026.09.09.1"
+APP_VERSION = "2026.09.10.1"
 OUTPUT_RANGE_OPTIONS = [("10 mV", 0.01), ("100 mV", 0.1), ("1 V", 1.0), ("10 V", 10.0)]
 
 # Default to the NI-MAX alias used by the original control program.  Startup
@@ -640,6 +643,33 @@ class PlotterWorker(QThread):
                     pass
 
 
+class LiveParticleAnalysisWorker(QThread):
+    """Apply the offline multi-width detector to a bounded live snapshot."""
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, time_s, frequency_hz, settings, thresholds=None):
+        super().__init__()
+        self.time_s = np.asarray(time_s, dtype=float)
+        self.frequency_hz = np.asarray(frequency_hz, dtype=float)
+        self.settings = settings
+        self.thresholds = thresholds
+
+    def run(self):
+        try:
+            data = pd.DataFrame({"Time_s": self.time_s, "Frequency_Hz": self.frequency_hz})
+            if self.thresholds is None:
+                payload = {"mode": "calibration",
+                           "thresholds": calibrate_detector(data, self.settings)}
+            else:
+                payload = {"mode": "detection",
+                           "events": detect_calibrated(data, self.settings, self.thresholds),
+                           "analyze_end": float(self.settings.analyze_end)}
+            self.completed.emit(payload)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class BaselineAnalysisWorker(QThread):
     """Offline-only analysis worker; it never touches HF2LI/DAQ objects."""
     completed = pyqtSignal(object)
@@ -769,6 +799,7 @@ class MainWindow(QMainWindow):
         self.sweep_worker = None
         self.pll_status_worker = None
         self.plotter_worker = None
+        self.live_particle_worker = None
         self.baseline_analysis_worker = None
         self.baseline_analysis_result = None
         self.baseline_analysis_source = None  # current raw log or imported CSV; never modifies raw data
@@ -798,6 +829,11 @@ class MainWindow(QMainWindow):
         self.received_sample_count = 0
         self.ui_refresh_durations_s = []
         self._last_plotter_ui_update_t = -np.inf
+        self._last_live_analysis_t = -np.inf
+        self.live_particle_thresholds = None
+        self.live_particle_events = []
+        self.live_particle_last_analyzed_s = 0.0
+        self.live_particle_generation = 0
         self.theory_modes = []
         self.theory_lines = []
 
@@ -895,6 +931,7 @@ class MainWindow(QMainWindow):
             "5. 실험조건 metadata", self._build_experiment_metadata_group(), expanded=False,
         ))
         left.addWidget(self._build_plotter_group())
+        left.addWidget(self._build_live_particle_group())
         left.addWidget(self._build_daq_group())
         left.addWidget(self._build_pingpong_group())
         left.addStretch(1)
@@ -914,7 +951,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_sweep_tab(), "① Sweeper (Amp/Phase vs Freq)")
         self.tabs.addTab(self._build_pll_tab(), "② PLL (Response)")
         self.tabs.addTab(self._build_plotter_tab(), "③ Plotter (Freq & R vs Time)")
-        self.tabs.addTab(self._build_baseline_tab(), "④ Baseline Analysis")
+        self.tabs.addTab(self._build_live_particle_tab(), "④ 실시간 파티클 검출")
+        self.tabs.addTab(self._build_baseline_tab(), "⑤ Baseline Analysis")
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(left_scroll)
@@ -1024,6 +1062,83 @@ class MainWindow(QMainWindow):
         self.plotter_hist_item = pg.BarGraphItem(x=[0], height=[0], width=1, brush='b')
         self.plotter_hist_plot.addItem(self.plotter_hist_item)
         return w
+
+    def _build_live_particle_tab(self):
+        """Demo-oriented live view: status cards, raw frequency and candidates."""
+        page = QWidget()
+        page.setStyleSheet("background: #f4f7fb;")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        title_row = QHBoxLayout()
+        title = QLabel("REAL-TIME PARTICLE DETECTION")
+        title.setStyleSheet("font-size: 22px; font-weight: 800; color: #14213d;")
+        subtitle = QLabel("PLL frequency · offline multi-width algorithm")
+        subtitle.setStyleSheet("color: #60708a; font-size: 12px;")
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        title_row.addWidget(subtitle)
+        layout.addLayout(title_row)
+
+        cards = QHBoxLayout()
+        self.live_state_value = QLabel("대기")
+        self.live_count_value = QLabel("0")
+        self.live_latest_value = QLabel("—")
+        self.live_frequency_value = QLabel("—")
+        for caption, value, accent in (
+            ("DETECTOR", self.live_state_value, "#147d64"),
+            ("PARTICLE CANDIDATES", self.live_count_value, "#1b65d6"),
+            ("LATEST DEPTH", self.live_latest_value, "#e07a1f"),
+            ("PLL FREQUENCY", self.live_frequency_value, "#6f42c1"),
+        ):
+            card = QWidget()
+            card.setStyleSheet(
+                "QWidget {background: white; border: 1px solid #dfe6ef; border-radius: 10px;}"
+                "QLabel {border: none; background: transparent;}"
+            )
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(14, 10, 14, 10)
+            label = QLabel(caption)
+            label.setStyleSheet("color: #718096; font-size: 10px; font-weight: 700;")
+            value.setStyleSheet(f"color: {accent}; font-size: 23px; font-weight: 800;")
+            card_layout.addWidget(label)
+            card_layout.addWidget(value)
+            cards.addWidget(card, 1)
+        layout.addLayout(cards)
+
+        self.live_calibration_progress = QProgressBar()
+        self.live_calibration_progress.setRange(0, 100)
+        self.live_calibration_progress.setValue(0)
+        self.live_calibration_progress.setFormat("검출 준비 대기")
+        self.live_calibration_progress.setStyleSheet(
+            "QProgressBar {background: #e6ebf2; border: none; border-radius: 5px; height: 10px; color: #445; text-align: center;}"
+            "QProgressBar::chunk {background: #22a884; border-radius: 5px;}"
+        )
+        layout.addWidget(self.live_calibration_progress)
+
+        self.live_particle_plot = pg.PlotWidget(background='w')
+        self.live_particle_plot.setLabel('bottom', 'Time (s)')
+        self.live_particle_plot.setLabel('left', 'PLL Frequency (Hz)')
+        self.live_particle_plot.showGrid(x=True, y=True, alpha=.25)
+        self.live_particle_plot.setMinimumHeight(360)
+        self.live_frequency_curve = self.live_particle_plot.plot(
+            pen=pg.mkPen('#1b65d6', width=2), name='Raw frequency')
+        self.live_particle_markers = pg.ScatterPlotItem(
+            size=15, symbol='t', brush=pg.mkBrush('#ff8a00'),
+            pen=pg.mkPen('#9a4c00', width=1.5), name='Detected candidate')
+        self.live_particle_plot.addItem(self.live_particle_markers)
+        layout.addWidget(self.live_particle_plot, 1)
+
+        self.live_event_list = QListWidget()
+        self.live_event_list.setMaximumHeight(135)
+        self.live_event_list.setAlternatingRowColors(True)
+        self.live_event_list.setStyleSheet(
+            "QListWidget {background: white; border: 1px solid #dfe6ef; border-radius: 8px; padding: 4px;}"
+        )
+        self.live_event_list.addItem("검출된 후보가 여기에 실시간으로 표시됩니다.")
+        layout.addWidget(self.live_event_list)
+        return page
 
     def _build_baseline_tab(self):
         """Raw-preserving baseline diagnostics, updated only in baseline mode."""
@@ -1732,8 +1847,60 @@ class MainWindow(QMainWindow):
 
         return g
 
+    def _build_live_particle_group(self):
+        g = QGroupBox("7. 실시간 파티클 검출 — 데모")
+        layout = QGridLayout(g)
+
+        self.live_particle_enabled = QCheckBox("PLL / Plotter 실행 중 자동 검출")
+        self.live_particle_enabled.setChecked(True)
+        self.live_particle_enabled.setToolTip(
+            "첫 blank 구간의 국소 깊이 noise로 문턱을 고정한 뒤 "
+            "오프라인 분석기와 같은 short(≤0.20초) 깊이 검출을 적용합니다."
+        )
+        self.live_particle_enabled.toggled.connect(self.reset_live_particle_detector)
+        layout.addWidget(self.live_particle_enabled, 0, 0, 1, 2)
+
+        layout.addWidget(QLabel("초기 blank 학습 (s):"), 1, 0)
+        self.live_calibration_spin = QDoubleSpinBox()
+        self.live_calibration_spin.setRange(6.0, 60.0)
+        self.live_calibration_spin.setDecimals(1)
+        self.live_calibration_spin.setValue(8.0)
+        self.live_calibration_spin.setSuffix(" s")
+        layout.addWidget(self.live_calibration_spin, 1, 1)
+
+        layout.addWidget(QLabel("깊이 noise 배수 / 최소 깊이:"), 2, 0)
+        sensitivity = QHBoxLayout()
+        self.live_sigma_spin = QDoubleSpinBox()
+        self.live_sigma_spin.setRange(1.0, 30.0)
+        self.live_sigma_spin.setDecimals(1)
+        self.live_sigma_spin.setValue(6.0)
+        self.live_floor_spin = QDoubleSpinBox()
+        self.live_floor_spin.setRange(0.001, 10000.0)
+        self.live_floor_spin.setDecimals(3)
+        self.live_floor_spin.setValue(0.15)
+        self.live_floor_spin.setSuffix(" Hz")
+        sensitivity.addWidget(self.live_sigma_spin)
+        sensitivity.addWidget(QLabel("× /"))
+        sensitivity.addWidget(self.live_floor_spin)
+        layout.addLayout(sensitivity, 2, 1)
+
+        self.live_reset_btn = QPushButton("검출 초기화 · blank 재학습")
+        self.live_reset_btn.clicked.connect(self.reset_live_particle_detector)
+        layout.addWidget(self.live_reset_btn, 3, 0, 1, 2)
+
+        self.live_detector_status = QLabel("대기: Plotter를 시작하면 자동으로 blank를 학습합니다.")
+        self.live_detector_status.setWordWrap(True)
+        self.live_detector_status.setStyleSheet("font-weight: 700; color: #147d64;")
+        layout.addWidget(self.live_detector_status, 4, 0, 1, 2)
+
+        self.live_export_btn = QPushButton("실시간 후보 CSV 저장")
+        self.live_export_btn.setEnabled(False)
+        self.live_export_btn.clicked.connect(self.export_live_particle_csv)
+        layout.addWidget(self.live_export_btn, 5, 0, 1, 2)
+        return g
+
     def _build_daq_group(self):
-        g = QGroupBox("7. 에어레귤레이터 (NI-DAQ, Dev3)")
+        g = QGroupBox("8. 에어레귤레이터 (NI-DAQ)")
         layout = QGridLayout(g)
 
         self.daq_spins = {}
@@ -1758,7 +1925,7 @@ class MainWindow(QMainWindow):
         return g
 
     def _build_pingpong_group(self):
-        g = QGroupBox("7. 파티클 반복측정 (Pneumatic Ping-Pong)")
+        g = QGroupBox("9. 파티클 반복측정 (Pneumatic Ping-Pong)")
         layout = QGridLayout(g)
         row = 0
 
@@ -2630,7 +2797,7 @@ class MainWindow(QMainWindow):
             # trend is watched on the Plotter, so make sure it's running.
             if self.plotter_worker is None or not self.plotter_worker.isRunning():
                 self.start_plotter()
-            self.tabs.setCurrentIndex(2)
+            self.tabs.setCurrentIndex(3 if self.live_particle_enabled.isChecked() else 2)
         else:
             if self.pll_status_worker:
                 self.pll_status_worker.stop()
@@ -2773,6 +2940,194 @@ class MainWindow(QMainWindow):
         self.received_sample_count = 0
         self.ui_refresh_durations_s = []
 
+    def reset_live_particle_detector(self, *_args):
+        """Clear live results and start a fresh particle-free calibration."""
+        self.live_particle_generation += 1
+        self.live_particle_thresholds = None
+        self.live_particle_events = []
+        self.live_particle_last_analyzed_s = 0.0
+        self._last_live_analysis_t = -np.inf
+        self.live_event_list.clear()
+        self.live_event_list.addItem("검출된 후보가 여기에 실시간으로 표시됩니다.")
+        self.live_particle_markers.setData([], [])
+        self.live_count_value.setText("0")
+        self.live_latest_value.setText("—")
+        self.live_export_btn.setEnabled(False)
+        if self.baseline_active:
+            self.live_state_value.setText("BASELINE")
+            self.live_calibration_progress.setValue(0)
+            self.live_calibration_progress.setFormat("Baseline 모드에서는 검출 중지")
+            self.live_detector_status.setStyleSheet("font-weight: 700; color: #60708a;")
+            self.live_detector_status.setText("Baseline 측정 보호를 위해 파티클 검출을 실행하지 않습니다.")
+        elif self.live_particle_enabled.isChecked():
+            self.live_detector_status.setStyleSheet("font-weight: 700; color: #147d64;")
+            self.live_state_value.setText("학습 대기")
+            self.live_calibration_progress.setValue(0)
+            self.live_calibration_progress.setFormat("blank 학습 대기")
+            self.live_detector_status.setText(
+                "준비: Plotter 시작 후 처음 구간은 입자 없이 유지하세요."
+            )
+        else:
+            self.live_detector_status.setStyleSheet("font-weight: 700; color: #60708a;")
+            self.live_state_value.setText("꺼짐")
+            self.live_calibration_progress.setValue(0)
+            self.live_calibration_progress.setFormat("실시간 검출 꺼짐")
+            self.live_detector_status.setText("실시간 파티클 검출이 꺼져 있습니다.")
+
+    def _schedule_live_particle_analysis(self, latest_t):
+        if not self.live_particle_enabled.isChecked() or self.baseline_active or len(self.log_t) < 30:
+            return
+        warmup = self.live_calibration_spin.value()
+        start_t = float(self.log_t[0])
+        elapsed = max(0.0, latest_t - start_t)
+        if self.live_particle_thresholds is None:
+            progress = min(100, int(round(100.0 * elapsed / warmup)))
+            self.live_calibration_progress.setValue(progress)
+            self.live_calibration_progress.setFormat(f"blank 학습 {min(elapsed, warmup):.1f} / {warmup:.1f} s")
+            self.live_state_value.setText("BLANK 학습")
+            self.live_detector_status.setText(
+                "초기 noise를 학습 중입니다. 이 구간에는 입자를 통과시키지 마세요."
+            )
+            if elapsed < warmup:
+                return
+        if self.live_particle_worker is not None and self.live_particle_worker.isRunning():
+            return
+        if latest_t - self._last_live_analysis_t < 0.25:
+            return
+        self._last_live_analysis_t = latest_t
+        widths = (.03, .05, .10, .20)
+        # Local depth fits the baseline from samples 0.25-0.55 s away.
+        margin = .60
+        if self.live_particle_thresholds is None:
+            right_t = start_t + warmup
+            right = int(np.searchsorted(self.log_t, right_t, side='right'))
+            time_s = np.asarray(self.log_t[:right], dtype=float)
+            frequency_hz = np.asarray(self.log_f[:right], dtype=float)
+            settings = ParticleSettings(
+                widths=widths, reference_start=start_t + margin,
+                reference_end=right_t - margin,
+                sigma_multiplier=self.live_sigma_spin.value(),
+                floor_hz=self.live_floor_spin.value(),
+            )
+        else:
+            segment_start = max(start_t, latest_t - 20.0)
+            left = int(np.searchsorted(self.log_t, segment_start, side='left'))
+            time_s = np.asarray(self.log_t[left:], dtype=float)
+            frequency_hz = np.asarray(self.log_f[left:], dtype=float)
+            analyze_end = latest_t - margin
+            analyze_start = max(float(time_s[0]) + margin,
+                                self.live_particle_last_analyzed_s - 0.35)
+            if analyze_end <= analyze_start:
+                return
+            settings = ParticleSettings(
+                widths=widths, analyze_start=analyze_start, analyze_end=analyze_end,
+                sigma_multiplier=self.live_sigma_spin.value(),
+                floor_hz=self.live_floor_spin.value(),
+            )
+        worker = LiveParticleAnalysisWorker(
+            time_s, frequency_hz, settings, self.live_particle_thresholds)
+        worker.generation = self.live_particle_generation
+        worker.completed.connect(self.on_live_particle_analysis)
+        worker.failed.connect(self.on_live_particle_failed)
+        self.live_particle_worker = worker
+        worker.start()
+
+    def on_live_particle_analysis(self, payload):
+        worker = self.sender()
+        if getattr(worker, 'generation', -1) != self.live_particle_generation:
+            return
+        if payload["mode"] == "calibration":
+            self.live_particle_thresholds = payload["thresholds"]
+            self.live_calibration_progress.setValue(100)
+            self.live_calibration_progress.setFormat("blank 학습 완료 · 실시간 감시 중")
+            self.live_state_value.setText("감시 중")
+            threshold_text = min(row['threshold_hz'] for row in self.live_particle_thresholds)
+            self.live_detector_status.setText(
+                f"검출 준비 완료 · short 깊이 기준 · 적용 문턱 {threshold_text:.3g} Hz"
+            )
+            return
+
+        self.live_particle_last_analyzed_s = max(
+            self.live_particle_last_analyzed_s, float(payload["analyze_end"]))
+        new_events = []
+        for event in payload.get("events", []):
+            separation = .30 if event['family'] == 'short' else .80
+            duplicate = any(
+                saved['family'] == event['family'] and
+                abs(saved['time_s'] - event['time_s']) < separation
+                for saved in self.live_particle_events
+            )
+            if duplicate:
+                continue
+            index = int(np.searchsorted(self.log_t, event['time_s']))
+            index = min(max(index, 0), len(self.log_f) - 1)
+            event = dict(event, frequency_hz=float(self.log_f[index]),
+                         detected_at_local=datetime.now().astimezone().isoformat(timespec='milliseconds'))
+            self.live_particle_events.append(event)
+            new_events.append(event)
+        self.live_particle_events.sort(key=lambda event: event['time_s'])
+        if new_events:
+            if self.live_event_list.count() == 1 and "여기에" in self.live_event_list.item(0).text():
+                self.live_event_list.clear()
+            for event in new_events:
+                number = self.live_particle_events.index(event) + 1
+                family = "SHORT" if event['family'] == 'short' else "WIDE"
+                self.live_event_list.addItem(
+                    f"● #{number:02d}  {event['time_s']:8.3f} s   "
+                    f"깊이 {event['depth_hz']:.4g} Hz   구간 {1000*event.get('duration_s',0):.0f} ms   {family}   "
+                    f"S/N {event['reference_ratio']:.1f}×"
+                )
+            self.live_event_list.scrollToBottom()
+            latest = max(new_events, key=lambda event: event['time_s'])
+            self.live_latest_value.setText(f"{latest['depth_hz']:.4g} Hz")
+            self.live_state_value.setText("검출!")
+        else:
+            self.live_state_value.setText("감시 중")
+        self.live_count_value.setText(str(len(self.live_particle_events)))
+        self.live_export_btn.setEnabled(bool(self.live_particle_events))
+        self._update_live_particle_markers()
+
+    def on_live_particle_failed(self, message):
+        worker = self.sender()
+        if getattr(worker, 'generation', -1) != self.live_particle_generation:
+            return
+        self.live_state_value.setText("확인 필요")
+        self.live_detector_status.setText(f"실시간 검출 일시 중단: {message}")
+        self.live_detector_status.setStyleSheet("font-weight: 700; color: #b42318;")
+
+    def _update_live_particle_markers(self):
+        if not self.live_particle_events:
+            self.live_particle_markers.setData([], [])
+            return
+        cutoff = self.plot_t[0] if self.plot_t else -np.inf
+        shown = [event for event in self.live_particle_events if event['time_s'] >= cutoff]
+        self.live_particle_markers.setData(
+            [event['time_s'] for event in shown],
+            [event['frequency_hz'] for event in shown],
+        )
+
+    def export_live_particle_csv(self):
+        if not self.live_particle_events:
+            QMessageBox.information(self, "저장할 후보 없음", "아직 검출된 파티클 후보가 없습니다.")
+            return
+        default_name = f"live_particles_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        path, _ = QFileDialog.getSaveFileName(self, "실시간 파티클 후보 저장", default_name, "CSV Files (*.csv)")
+        if not path:
+            return
+        fields = ["event_index", "time_s", "peak_time_s", "event_start_s", "event_end_s",
+                  "duration_s", "selection_source", "frequency_hz", "depth_hz", "contrast_hz",
+                  "width_s", "family", "reference_ratio", "detection_threshold_hz",
+                  "local_max_jump_hz", "quality", "detected_at_local"]
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields, extrasaction='ignore')
+                writer.writeheader()
+                for index, event in enumerate(self.live_particle_events, 1):
+                    writer.writerow({"event_index": index, **event})
+            QMessageBox.information(self, "저장 완료", f"{len(self.live_particle_events)}개 후보를 저장했습니다.\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "저장 오류", str(exc))
+
     def start_plotter(self, baseline=False):
         if not self.hf:
             return
@@ -2793,7 +3148,8 @@ class MainWindow(QMainWindow):
         self.baseline_amplitude_curve.setData([], [])
         self.baseline_error_curve.setData([], [])
         self.baseline_stats_label.setText("Baseline 분석: 수집 중... (raw data, no software smoothing)")
-        self.tabs.setCurrentIndex(3 if self.baseline_active else 2)
+        self.reset_live_particle_detector()
+        self.tabs.setCurrentIndex(4 if self.baseline_active else 3)
 
         requested_rate_hz = self.plotter_rate_spin.value()
         self.plotter_worker = PlotterWorker(
@@ -2873,6 +3229,7 @@ class MainWindow(QMainWindow):
                 poll_latency, pll_latency,
             )
         latest_t = batch[-1][0]
+        self._schedule_live_particle_analysis(latest_t)
         if latest_t - self._last_plotter_ui_update_t >= 0.05:
             self._last_plotter_ui_update_t = latest_t
             self._refresh_plotter_ui(latest_t)
@@ -2939,6 +3296,10 @@ class MainWindow(QMainWindow):
         display_stride = max(1, len(self.plot_t) // 5000)
         self.plotter_freq_curve.setData(self.plot_t[::display_stride], self.plot_f[::display_stride])
         self.plotter_r_curve.setData(self.plot_t[::display_stride], self.plot_R[::display_stride])
+        self.live_frequency_curve.setData(self.plot_t[::display_stride], self.plot_f[::display_stride])
+        if self.plot_f:
+            self.live_frequency_value.setText(f"{self.plot_f[-1]:,.3f} Hz")
+        self._update_live_particle_markers()
 
         channel_map = {
             "Frequency (Hz)": self.plot_f,
@@ -3482,7 +3843,7 @@ class MainWindow(QMainWindow):
         self.pp_start_btn.setEnabled(False)
         self.pp_stop_btn.setEnabled(True)
         self.pp_status_label.setText("상태: 기준선 수집 중...")
-        self.tabs.setCurrentIndex(2)
+        self.tabs.setCurrentIndex(3 if self.live_particle_enabled.isChecked() else 2)
 
     def stop_pingpong(self):
         self.pingpong_active = False
@@ -3590,6 +3951,8 @@ class MainWindow(QMainWindow):
         if self.plotter_worker:
             self.plotter_worker.stop()
             self.plotter_worker.wait(1000)
+        if self.live_particle_worker and self.live_particle_worker.isRunning():
+            self.live_particle_worker.wait(2000)
         self.pll_enable_btn.setChecked(False)
         self.output_on_btn.setChecked(False)
         self.amp_enable_btn.setChecked(False)
