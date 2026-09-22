@@ -50,10 +50,11 @@ import os
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QDoubleSpinBox, QSpinBox, QPushButton, QGroupBox, QListWidget,
@@ -66,7 +67,7 @@ from zi_hf2_api import ZiHF2, ZiAPIError
 from beam_modes import TubeBeam, calculate_modes
 from sweep_math import make_filter_plan, average_complex_samples, tc_from_bandwidth_3db
 from resonance_fit import (fit_complex_resonance, model_response,
-                           detect_resonance_peaks, assess_fit_quality)
+                           detect_resonance_peaks, assess_fit_quality, three_db_bounds)
 from pll_design import design_pll
 from baseline_analysis import (timing_quality, linear_baseline, rolling_metrics,
                                event_timescale_noise, false_event_distribution,
@@ -78,6 +79,10 @@ from baseline_analysis import (timing_quality, linear_baseline, rolling_metrics,
 from experiment_analysis import compare_baselines, write_comparison, integration_diagnostics
 from particle_review_core import Settings as ParticleSettings
 from particle_review_core import calibrate_detector, detect_calibrated
+from live_savgol import filter_frequency
+from session_storage import PlotterSpool, atomic_json, atomic_sweep
+from allan_export import save_allan_export
+from pressure_monitor import PressureMonitor, pressure_kpa
 
 try:
     import nidaqmx
@@ -107,6 +112,10 @@ HF2_DEMOD = 0                 # demodulator reading the sense piezo (for R/theta
 HF2_PLL = 0
 
 MAX_DRIVE_V = 10.0            # hard safety limit, HF2LI output feeds the piezo directly
+STATE_DIR = (Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ResonanceGUI"
+             if getattr(sys, "frozen", False) else Path(__file__).resolve().parent / ".resonance_state")
+LIVE_LOG_MAX_ROWS = 100000
+LIVE_LOG_WINDOW_S = 120.0
 APP_VERSION = "2026.09.10.1"
 OUTPUT_RANGE_OPTIONS = [("10 mV", 0.01), ("100 mV", 0.1), ("1 V", 1.0), ("10 V", 10.0)]
 
@@ -648,16 +657,19 @@ class LiveParticleAnalysisWorker(QThread):
     completed = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, time_s, frequency_hz, settings, thresholds=None):
+    def __init__(self, time_s, frequency_hz, settings, thresholds=None, savgol=None):
         super().__init__()
         self.time_s = np.asarray(time_s, dtype=float)
         self.frequency_hz = np.asarray(frequency_hz, dtype=float)
         self.settings = settings
         self.thresholds = thresholds
+        self.savgol = savgol or {"enabled": False}
 
     def run(self):
         try:
-            data = pd.DataFrame({"Time_s": self.time_s, "Frequency_Hz": self.frequency_hz})
+            filtered, window_samples = filter_frequency(
+                self.time_s, self.frequency_hz, **self.savgol)
+            data = pd.DataFrame({"Time_s": self.time_s, "Frequency_Hz": filtered})
             if self.thresholds is None:
                 payload = {"mode": "calibration",
                            "thresholds": calibrate_detector(data, self.settings)}
@@ -665,6 +677,10 @@ class LiveParticleAnalysisWorker(QThread):
                 payload = {"mode": "detection",
                            "events": detect_calibrated(data, self.settings, self.thresholds),
                            "analyze_end": float(self.settings.analyze_end)}
+            payload["savgol_window_samples"] = window_samples
+            payload["savgol_effective_window_ms"] = (
+                1000.0 * window_samples * float(np.median(np.diff(self.time_s)))
+                if window_samples else 0.0)
             self.completed.emit(payload)
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -799,6 +815,16 @@ class MainWindow(QMainWindow):
         self.sweep_worker = None
         self.pll_status_worker = None
         self.plotter_worker = None
+        self.plotter_spool = None
+        self.calibration_t = []
+        self.calibration_f = []
+        self._calibration_sample_index = 0
+        self.analysis_t, self.analysis_f = [], []
+        self._analysis_sample_index = 0
+        self._display_sample_index = 0
+        self._log_sample_index = 0
+        self._recent_raw_dt_s = []
+        self._last_raw_t = None
         self.live_particle_worker = None
         self.baseline_analysis_worker = None
         self.baseline_analysis_result = None
@@ -846,8 +872,8 @@ class MainWindow(QMainWindow):
         self.plot_x = []
         self.plot_y = []
 
-        # Full-session Plotter log (NOT trimmed) for CSV export -- the
-        # display buffers above only keep the last `window` seconds.
+        # Bounded recent samples for live analysis. The complete raw session
+        # is written to PlotterSpool and exported from that file.
         self.log_t = []
         self.log_R = []
         self.log_theta = []
@@ -873,9 +899,8 @@ class MainWindow(QMainWindow):
         self._switch_event_pending = False
         self._last_flow_direction = "Idle"
         self.pressure_commands = {channel: 0.0 for channel in DAQ_CHANNELS.values()}
-        # Optional sensor inputs are deliberately explicit: no NI analog-input
-        # channel is configured in this project yet, so the raw CSV columns are
-        # retained as empty values instead of fabricating measurements.
+        self.pressure_worker = None
+        self.pressure_sample_time = None
         self.measured_pressure_a = None
         self.measured_pressure_b = None
         self.temperature_c = None
@@ -893,7 +918,100 @@ class MainWindow(QMainWindow):
         self.pingpong_events = []  # list of (t, depth_hz, duration_s)
 
         self._build_ui()
+        self._restore_last_settings()
+        self._restore_last_sweep()
+        self._install_settings_autosave()
         self._connect_hardware()
+
+    def _settings_widgets(self):
+        names = (
+            "f_start_spin", "f_stop_spin", "n_points_spin", "sweep_filter_mode_combo",
+            "sweep_filter_order_spin", "sweep_fixed_bw_spin", "sweep_max_bw_spin",
+            "sweep_suppression_spin", "sweep_overlap_check", "sweep_min_settle_spin",
+            "sweep_residual_spin", "sweep_samples_spin", "sweep_avg_time_spin",
+            "sweep_avg_tc_spin", "sweep_rate_spin", "pll_center_spin", "pll_input_combo",
+            "pll_q_spin", "pll_setpoint_spin", "pll_order_spin", "pll_tc_spin",
+            "pll_range_spin", "pll_target_bw_spin", "pll_p_spin", "pll_i_spin",
+            "pll_d_spin", "pll_pm_spin", "pll_derivative_check", "pll_integral_check",
+            "pll_invert_sign_check",
+            "live_savgol_enabled", "live_savgol_window_spin", "live_savgol_order_spin",
+        )
+        return {name: getattr(self, name) for name in names}
+
+    def _save_last_settings(self):
+        values = {}
+        for name, widget in self._settings_widgets().items():
+            if isinstance(widget, QComboBox):
+                values[name] = widget.currentData() if name == "pll_input_combo" else widget.currentText()
+            elif isinstance(widget, QCheckBox):
+                values[name] = widget.isChecked()
+            else:
+                values[name] = widget.value()
+        atomic_json(STATE_DIR / "last_settings.json", {"version": 1, "values": values})
+
+    def _restore_last_settings(self):
+        path = STATE_DIR / "last_settings.json"
+        if not path.exists():
+            return
+        try:
+            values = json.loads(path.read_text(encoding="utf-8")).get("values", {})
+            old_sg_ms = isinstance(values.get("live_savgol_window_spin"), float)
+            for name, widget in self._settings_widgets().items():
+                if name not in values:
+                    continue
+                value = values[name]
+                if old_sg_ms and name in ("live_savgol_window_spin", "live_savgol_order_spin"):
+                    # Earlier versions stored milliseconds and defaulted to
+                    # order 2; use the offline defaults for the new units.
+                    continue
+                if isinstance(widget, QComboBox):
+                    if name == "pll_input_combo":
+                        index = widget.findData(value)
+                        if index >= 0:
+                            widget.setCurrentIndex(index)
+                    elif widget.findText(value) >= 0:
+                        widget.setCurrentText(value)
+                elif isinstance(widget, QCheckBox):
+                    widget.setChecked(bool(value))
+                elif isinstance(value, (int, float)) and np.isfinite(value):
+                    widget.setValue(value)
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"Last settings could not be restored: {exc}", file=sys.stderr)
+
+    def _install_settings_autosave(self):
+        self.settings_save_timer = QTimer(self)
+        self.settings_save_timer.setSingleShot(True)
+        self.settings_save_timer.timeout.connect(self._save_last_settings)
+        for widget in self._settings_widgets().values():
+            if isinstance(widget, QComboBox):
+                widget.currentIndexChanged.connect(lambda *_: self.settings_save_timer.start(500))
+            elif isinstance(widget, QCheckBox):
+                widget.toggled.connect(lambda *_: self.settings_save_timer.start(500))
+            else:
+                widget.valueChanged.connect(lambda *_: self.settings_save_timer.start(500))
+
+    def _save_last_sweep(self):
+        arrays = {key: np.asarray(value) for key, value in self.sweep_metadata.items()}
+        if len(arrays.get("freqs", [])):
+            atomic_sweep(STATE_DIR / "last_sweep.npz", arrays)
+
+    def _restore_last_sweep(self):
+        path = STATE_DIR / "last_sweep.npz"
+        if not path.exists():
+            return
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                result = {key: data[key].copy() for key in data.files}
+            freqs, R, theta = result["freqs"], result["R"], result["theta"]
+            self.sweep_freqs, self.sweep_R, self.sweep_theta = freqs, R, theta
+            self.sweep_X, self.sweep_Y = result["X"], result["Y"]
+            self.sweep_X_sem, self.sweep_Y_sem = result["X_sem"], result["Y_sem"]
+            self.sweep_metadata = result
+            self.sweep_amp_curve.setData(freqs, R)
+            self.sweep_phase_curve.setData(freqs, theta)
+            self.detect_peaks(freqs, R, theta)
+        except (OSError, KeyError, ValueError) as exc:
+            print(f"Last sweep could not be restored: {exc}", file=sys.stderr)
 
     # ------------------------------------------------------------------
     def _build_ui(self):
@@ -1124,6 +1242,12 @@ class MainWindow(QMainWindow):
         self.live_particle_plot.setMinimumHeight(360)
         self.live_frequency_curve = self.live_particle_plot.plot(
             pen=pg.mkPen('#1b65d6', width=2), name='Raw frequency')
+        self.live_filtered_frequency_curve = self.live_particle_plot.plot(
+            pen=pg.mkPen('#d13b73', width=2), name='SG filtered')
+        self.live_filtered_frequency_curve.setVisible(False)
+        live_legend = self.live_particle_plot.addLegend(offset=(12, 12))
+        live_legend.addItem(self.live_frequency_curve, 'Raw frequency')
+        live_legend.addItem(self.live_filtered_frequency_curve, 'SG filtered')
         self.live_particle_markers = pg.ScatterPlotItem(
             size=15, symbol='t', brush=pg.mkBrush('#ff8a00'),
             pen=pg.mkPen('#9a4c00', width=1.5), name='Detected candidate')
@@ -1750,8 +1874,8 @@ class MainWindow(QMainWindow):
         baseline_layout.addWidget(self.baseline_stats_label, 0, 0, 1, 2)
 
         analysis_row = QHBoxLayout()
-        self.baseline_analysis_btn = QPushButton("Baseline 상세 분석 실행 (현재 raw 기록)")
-        self.baseline_analysis_btn.setToolTip("획득/PLL과 분리된 worker에서 timestamp·rolling·event-timescale·false-event 분석을 실행합니다.")
+        self.baseline_analysis_btn = QPushButton("Baseline 상세 분석 실행 (최근 분석 구간)")
+        self.baseline_analysis_btn.setToolTip("최근 최대 120초/10만 분석 샘플을 사용합니다. 전체 raw 기록은 CSV 저장으로 보존됩니다.")
         self.baseline_analysis_btn.clicked.connect(self.run_baseline_analysis)
         analysis_row.addWidget(self.baseline_analysis_btn)
         self.baseline_load_btn = QPushButton("평가/입자 CSV 분석")
@@ -1798,13 +1922,29 @@ class MainWindow(QMainWindow):
         self.baseline_derived_export_btn = QPushButton("Derived CSV 저장")
         self.baseline_derived_export_btn.setEnabled(False)
         self.baseline_derived_export_btn.clicked.connect(self.export_baseline_derived_csv)
+        self.baseline_allan_export_btn = QPushButton("Allan 그래프·CSV 따로 저장")
+        self.baseline_allan_export_btn.setEnabled(False)
+        self.baseline_allan_export_btn.clicked.connect(self.export_baseline_allan)
         self.event_export_btn = QPushButton("Event/Threshold CSV 저장")
         self.event_export_btn.setEnabled(False)
         self.event_export_btn.clicked.connect(self.export_event_analysis_csv)
         analysis_export_row.addWidget(self.baseline_summary_export_btn)
         analysis_export_row.addWidget(self.baseline_derived_export_btn)
+        analysis_export_row.addWidget(self.baseline_allan_export_btn)
         analysis_export_row.addWidget(self.event_export_btn)
         baseline_layout.addLayout(analysis_export_row, 7, 0, 1, 2)
+
+        allan_calibration_row = QHBoxLayout()
+        self.allan_sensitivity_spin = QDoubleSpinBox()
+        self.allan_sensitivity_spin.setRange(0.0, 1e15)
+        self.allan_sensitivity_spin.setDecimals(3)
+        self.allan_sensitivity_spin.setValue(0.0)
+        self.allan_sensitivity_spin.setToolTip(
+            "해당 공진 모드의 측정된 질량 감도(pg/Hz)를 입력하면 µg로 환산합니다. "
+            "0이면 주파수 Allan deviation(Hz)을 저장합니다.")
+        allan_calibration_row.addWidget(QLabel("질량 감도 (pg/Hz, 0=Hz 그래프):"))
+        allan_calibration_row.addWidget(self.allan_sensitivity_spin)
+        baseline_layout.addLayout(allan_calibration_row, 8, 0, 1, 2)
 
         audit_row = QHBoxLayout()
         compare_btn = QPushButton("반복 baseline 비교")
@@ -1816,7 +1956,7 @@ class MainWindow(QMainWindow):
         audit_row.addWidget(compare_btn)
         audit_row.addWidget(integration_btn)
         audit_row.addWidget(bundle_btn)
-        baseline_layout.addLayout(audit_row, 8, 0, 1, 2)
+        baseline_layout.addLayout(audit_row, 9, 0, 1, 2)
 
         layout.addWidget(CollapsibleSection(
             "Baseline 분석 및 내보내기", baseline_analysis, expanded=False,
@@ -1884,20 +2024,66 @@ class MainWindow(QMainWindow):
         sensitivity.addWidget(self.live_floor_spin)
         layout.addLayout(sensitivity, 2, 1)
 
+        self.live_savgol_enabled = QCheckBox("검출에 Savitzky–Golay 적용 · 필터선 실시간 표시")
+        self.live_savgol_enabled.setChecked(False)
+        self.live_savgol_enabled.setToolTip(
+            "blank 학습과 후보 검출에 적용하고 실시간 파티클 그래프에 같은 필터 결과를 분홍색으로 표시합니다. "
+            "원시 그래프와 저장 CSV는 변경하지 않습니다. 설정을 바꾸면 문턱을 다시 학습합니다."
+        )
+        layout.addWidget(self.live_savgol_enabled, 3, 0, 1, 2)
+        sg_controls = QHBoxLayout()
+        self.live_savgol_window_spin = QSpinBox()
+        self.live_savgol_window_spin.setRange(3, 501)
+        self.live_savgol_window_spin.setSingleStep(2)
+        self.live_savgol_window_spin.setValue(27)
+        self.live_savgol_window_spin.setSuffix(" 표본")
+        self.live_savgol_window_spin.setToolTip(
+            "오프라인 SG와 같은 표본 수입니다. 짝수는 다음 홀수로 바뀝니다. "
+            "고속 획득에서는 실시간 검출 샘플이 최대 약 4 kSa/s로 줄어들 수 있어 "
+            "같은 표본 수의 시간 폭이 원시 CSV와 다를 수 있습니다."
+        )
+        self.live_savgol_order_spin = QSpinBox()
+        self.live_savgol_order_spin.setRange(1, 8)
+        self.live_savgol_order_spin.setValue(4)
+        sg_controls.addWidget(self.live_savgol_window_spin)
+        sg_controls.addWidget(QLabel("/ 다항 차수"))
+        sg_controls.addWidget(self.live_savgol_order_spin)
+        layout.addWidget(QLabel("필터 Window / 차수:"), 4, 0)
+        layout.addLayout(sg_controls, 4, 1)
+        self.live_savgol_window_spin.setEnabled(False)
+        self.live_savgol_order_spin.setEnabled(False)
+        self.live_savgol_enabled.toggled.connect(self.live_savgol_window_spin.setEnabled)
+        self.live_savgol_enabled.toggled.connect(self.live_savgol_order_spin.setEnabled)
+        self.live_savgol_enabled.toggled.connect(self._set_live_filtered_trace_visible)
+        self.live_savgol_enabled.toggled.connect(self.reset_live_particle_detector)
+        self.live_savgol_window_spin.valueChanged.connect(self._normalize_live_savgol_window)
+        self.live_savgol_order_spin.valueChanged.connect(self.reset_live_particle_detector)
+
         self.live_reset_btn = QPushButton("검출 초기화 · blank 재학습")
         self.live_reset_btn.clicked.connect(self.reset_live_particle_detector)
-        layout.addWidget(self.live_reset_btn, 3, 0, 1, 2)
+        layout.addWidget(self.live_reset_btn, 5, 0, 1, 2)
 
         self.live_detector_status = QLabel("대기: Plotter를 시작하면 자동으로 blank를 학습합니다.")
         self.live_detector_status.setWordWrap(True)
         self.live_detector_status.setStyleSheet("font-weight: 700; color: #147d64;")
-        layout.addWidget(self.live_detector_status, 4, 0, 1, 2)
+        layout.addWidget(self.live_detector_status, 6, 0, 1, 2)
 
         self.live_export_btn = QPushButton("실시간 후보 CSV 저장")
         self.live_export_btn.setEnabled(False)
         self.live_export_btn.clicked.connect(self.export_live_particle_csv)
-        layout.addWidget(self.live_export_btn, 5, 0, 1, 2)
+        layout.addWidget(self.live_export_btn, 7, 0, 1, 2)
         return g
+
+    def _normalize_live_savgol_window(self, value):
+        if value % 2 == 0:
+            self.live_savgol_window_spin.setValue(min(self.live_savgol_window_spin.maximum(), value + 1))
+            return
+        self.reset_live_particle_detector()
+
+    def _set_live_filtered_trace_visible(self, enabled):
+        self.live_filtered_frequency_curve.setVisible(bool(enabled))
+        if not enabled:
+            self.live_filtered_frequency_curve.setData([], [])
 
     def _build_daq_group(self):
         g = QGroupBox("8. 에어레귤레이터 (NI-DAQ)")
@@ -1922,7 +2108,89 @@ class MainWindow(QMainWindow):
         zero_btn.clicked.connect(self.zero_daq_channels)
         layout.addWidget(zero_btn, row, 0, 1, 3)
 
+        self.pressure_monitor_btn = QPushButton("실제 압력 읽기 시작 (AI0 / AI1)")
+        self.pressure_monitor_btn.setCheckable(True)
+        self.pressure_monitor_btn.toggled.connect(self._toggle_pressure_monitor)
+        layout.addWidget(self.pressure_monitor_btn, row + 1, 0, 1, 3)
+        self.pressure_readback_label = QLabel("A (AI0): —    B (AI1): —    A−B: —")
+        self.pressure_readback_label.setWordWrap(True)
+        layout.addWidget(self.pressure_readback_label, row + 2, 0, 1, 3)
+        note = QLabel("ITV0050 · RSE · COM → AI GND · 약 5 Hz\n"
+                      "1–5 V → 1–900 kPa 명목 환산 · 모니터 정확도 ±6% F.S.")
+        note.setWordWrap(True)
+        layout.addWidget(note, row + 3, 0, 1, 3)
+        self.pressure_watchdog = QTimer(self)
+        self.pressure_watchdog.timeout.connect(self._expire_pressure_sample)
+        self.pressure_watchdog.start(250)
+
         return g
+
+    def _toggle_pressure_monitor(self, enabled):
+        self.measured_pressure_a = self.measured_pressure_b = None
+        self.pressure_sample_time = None
+        if enabled:
+            self.pressure_readback_label.setText(f"{DAQ_DEVICE}/ai0:1 연결 중…")
+            self.pressure_worker = PressureMonitor(DAQ_DEVICE, self)
+            self.pressure_worker.sample.connect(self._pressure_sample)
+            self.pressure_worker.failed.connect(self._pressure_failed)
+            self.pressure_worker.finished.connect(self._pressure_finished)
+            self.pressure_monitor_btn.setText("실제 압력 읽기 중지")
+            self.pressure_worker.start()
+        elif self.pressure_worker is not None:
+            self.pressure_worker.requestInterruption()
+            self.pressure_monitor_btn.setEnabled(False)
+            self.pressure_readback_label.setText("압력 읽기 중지 중…")
+        if self.measurement_metadata:
+            self.measurement_metadata.setdefault("Pressure_monitor_events", []).append({
+                "timestamp_local": datetime.now().astimezone().isoformat(),
+                "enabled": bool(enabled), "channels": f"{DAQ_DEVICE}/ai0:1"})
+        self.metadata_actual_pressure_edit.setEnabled(not enabled)
+        self.metadata_pressure_source_combo.setEnabled(not enabled)
+
+    def _pressure_sample(self, a, b, timestamp):
+        if not self.pressure_monitor_btn.isChecked():
+            return
+        self.pressure_sample_time = timestamp
+        self.measured_pressure_a, self.measured_pressure_b = pressure_kpa(a), pressure_kpa(b)
+        def label(value, voltage):
+            return (f"{value:.1f} kPa ({voltage:.4f} V)" if value is not None
+                    else f"범위 밖 ({voltage:.4f} V)")
+        pa, pb = self.measured_pressure_a, self.measured_pressure_b
+        delta = f"{pa - pb:.1f} kPa" if pa is not None and pb is not None else "—"
+        self.pressure_readback_label.setText(
+            f"A (AI0): {label(pa, a)}\nB (AI1): {label(pb, b)}\nA−B: {delta}")
+        self._expire_pressure_sample()
+
+    def _expire_pressure_sample(self):
+        if (self.pressure_monitor_btn.isChecked() and self.pressure_sample_time is not None
+                and time.monotonic() - self.pressure_sample_time > 1.0):
+            self.measured_pressure_a = self.measured_pressure_b = None
+            self.pressure_readback_label.setText("압력 데이터 지연: 실측값 저장 중단")
+
+    def _pressure_failed(self, message):
+        self.measured_pressure_a = self.measured_pressure_b = None
+        self.pressure_sample_time = None
+        self.pressure_readback_label.setText(f"압력 읽기 오류: {message}")
+        if self.measurement_metadata:
+            self.measurement_metadata.setdefault("Pressure_monitor_events", []).append({
+                "timestamp_local": datetime.now().astimezone().isoformat(),
+                "error": message})
+
+    def _pressure_finished(self):
+        worker = self.pressure_worker
+        self.pressure_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self.pressure_monitor_btn.blockSignals(True)
+        self.pressure_monitor_btn.setChecked(False)
+        self.pressure_monitor_btn.blockSignals(False)
+        self.pressure_monitor_btn.setEnabled(True)
+        self.pressure_monitor_btn.setText("실제 압력 읽기 시작 (AI0 / AI1)")
+        if self.pressure_readback_label.text() == "압력 읽기 중지 중…":
+            self.pressure_readback_label.setText("압력 읽기 중지됨 · A: —  B: —")
+        self.measured_pressure_a = self.measured_pressure_b = None
+        self.metadata_actual_pressure_edit.setEnabled(True)
+        self.metadata_pressure_source_combo.setEnabled(True)
 
     def _build_pingpong_group(self):
         g = QGroupBox("9. 파티클 반복측정 (Pneumatic Ping-Pong)")
@@ -2065,13 +2333,14 @@ class MainWindow(QMainWindow):
                 self.range_combo.blockSignals(False)
             except Exception:
                 pass
-            try:
-                pll_input = self.hf.get_pll_input()
-                combo_index = self.pll_input_combo.findData(pll_input)
-                if combo_index >= 0:
-                    self.pll_input_combo.setCurrentIndex(combo_index)
-            except Exception:
-                pass
+            if not (STATE_DIR / "last_settings.json").exists():
+                try:
+                    pll_input = self.hf.get_pll_input()
+                    combo_index = self.pll_input_combo.findData(pll_input)
+                    if combo_index >= 0:
+                        self.pll_input_combo.setCurrentIndex(combo_index)
+                except Exception:
+                    pass
             for input_index in range(2):
                 try:
                     self._sync_input_controls(input_index)
@@ -2255,6 +2524,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "HF2LI 오류", str(e))
             return
 
+        self._save_last_settings()
+
         n = self.n_points_spin.value()
         self.sweep_freqs = np.full(n, np.nan)
         self.sweep_R = np.full(n, np.nan)
@@ -2330,6 +2601,9 @@ class MainWindow(QMainWindow):
         for key in result:
             result[key] = result[key][mask]
         freqs, R, theta = result["freqs"], result["R"], result["theta"]
+        if len(freqs) == 0:
+            self._restore_last_sweep()
+            return
         self.sweep_freqs, self.sweep_R, self.sweep_theta = freqs, R, theta
         self.sweep_X, self.sweep_Y = result["X"], result["Y"]
         self.sweep_X_sem, self.sweep_Y_sem = result["X_sem"], result["Y_sem"]
@@ -2337,17 +2611,19 @@ class MainWindow(QMainWindow):
         self.sweep_amp_curve.setData(freqs, R)
         self.sweep_phase_curve.setData(freqs, theta)
         self.detect_peaks(freqs, R, theta)
+        self._save_last_sweep()
 
     def on_sweep_failed(self, msg):
         self.run_sweep_btn.setEnabled(True)
         self.stop_sweep_btn.setEnabled(False)
+        self._restore_last_sweep()
         QMessageBox.critical(self, "스윕 오류", msg)
 
     # --- peak detection (Sweeper Math: Resonance Q / Center / Phase) ---
     def detect_peaks(self, freqs, R, theta):
         if len(R) < 5:
             return
-        idx, fwhm_values, _, noise_sigma = detect_resonance_peaks(freqs, R)
+        idx, fwhm_values, smooth, noise_sigma = detect_resonance_peaks(freqs, R)
         self.peak_list.clear()
         if len(idx) == 0:
             self.peak_list.addItem(
@@ -2360,14 +2636,19 @@ class MainWindow(QMainWindow):
         self._peak_candidates = []
         for k, i in enumerate(idx):
             f0 = freqs[i]
-            fwhm = fwhm_values[k]
+            bounds = three_db_bounds(freqs, smooth, i)
+            fwhm = bounds[1] - bounds[0] if bounds is not None else fwhm_values[k]
             q = f0 / fwhm if fwhm > 0 else float("nan")
             phase0 = theta[i]
             self._peak_candidates.append((f0, R[i], q, phase0))
             item = QListWidgetItem(
                 f"f0={f0:,.1f}Hz  Q≈{q:,.0f}  φ={phase0:.1f}°"
             )
-            item.setToolTip(f"f0 = {f0:,.3f} Hz\nQ ≈ {q:,.1f}\nphase = {phase0:.2f} deg\nR = {R[i]:.4g} V")
+            width_source = "−3 dB 교차점" if bounds is not None else "prominence 반폭 (−3 dB 교차점 미측정)"
+            item.setToolTip(
+                f"f0 = {f0:,.3f} Hz\nQ ≈ {q:,.1f}\n선폭 = {fwhm:,.2f} Hz ({width_source})\n"
+                f"phase = {phase0:.2f} deg\nR = {R[i]:.4g} V"
+            )
             self.peak_list.addItem(item)
         self.peak_markers.setData(
             freqs[idx], R[idx], data=np.arange(len(idx)), symbolBrush='r'
@@ -2494,14 +2775,27 @@ class MainWindow(QMainWindow):
             neighbors.append(self._peak_candidates[row + 1][0] - f0)
         nearest_neighbor = min((distance for distance in neighbors if distance > 0), default=np.inf)
         unconstrained_half_window = max(3.0 * linewidth, 8.0 * df)
-        isolation_half_window = 0.45 * nearest_neighbor if np.isfinite(nearest_neighbor) else 0.15 * span
+        isolation_half_window = 0.45 * nearest_neighbor if np.isfinite(nearest_neighbor) else np.inf
         half_window = min(unconstrained_half_window, isolation_half_window)
         half_window = max(half_window, 4.0 * df)
-        mask = np.abs(self.sweep_freqs - f0) <= half_window
+        peak_index = int(np.argmin(np.abs(self.sweep_freqs - f0)))
+        _, _, smooth, _ = detect_resonance_peaks(self.sweep_freqs, self.sweep_R)
+        bounds = three_db_bounds(self.sweep_freqs, smooth, peak_index)
+        if bounds is not None:
+            # The -3 dB crossings establish the core. Keep one more half-width
+            # on each side to identify the complex background and phase slope.
+            low = max(f0 - half_window, 2.0 * bounds[0] - f0)
+            high = min(f0 + half_window, 2.0 * bounds[1] - f0)
+            mask = (self.sweep_freqs >= low) & (self.sweep_freqs <= high)
+        else:
+            mask = np.abs(self.sweep_freqs - f0) <= half_window
         if np.count_nonzero(mask) < 9:
             order = np.argsort(np.abs(self.sweep_freqs - f0))[:max(9, min(41, len(self.sweep_freqs)))]
             mask = np.zeros(len(self.sweep_freqs), dtype=bool)
             mask[order] = True
+        self.last_resonance_fit = None
+        self.sweep_fit_amp_curve.setData([], [])
+        self.sweep_fit_phase_curve.setData([], [])
         try:
             fit = fit_complex_resonance(
                 self.sweep_freqs[mask], self.sweep_X[mask], self.sweep_Y[mask],
@@ -2522,9 +2816,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "복소 fitting 실패", fit.message)
             return None
         display_f = self.sweep_freqs[mask]
-        z_fit = model_response(display_f, fit.parameters, float(np.mean(display_f)))
-        self.sweep_fit_amp_curve.setData(display_f, np.abs(z_fit))
-        self.sweep_fit_phase_curve.setData(display_f, np.angle(z_fit, deg=True))
+        z_fit = model_response(display_f, fit.parameters, float(np.mean(display_f)),
+                               fit.resonance_sign)
         quality = assess_fit_quality(
             display_f, self.sweep_X[mask], self.sweep_Y[mask], fit,
         )
@@ -2546,11 +2839,13 @@ class MainWindow(QMainWindow):
                 )
             return None
         self.last_resonance_fit = fit
+        self.sweep_fit_amp_curve.setData(display_f, np.abs(z_fit))
+        self.sweep_fit_phase_curve.setData(display_f, np.angle(z_fit, deg=True))
         self.fit_result_label.setText(
             f"Fitting: f0={fit.f0_hz:,.5f}±{fit.f0_std_hz:.3g} Hz, "
             f"Q={fit.q:,.2f}±{fit.q_std:.2g}, Γ={fit.linewidth_hz:.4g} Hz, "
             f"dφ/df={fit.phase_slope_deg_per_hz:.4g} deg/Hz, {quality_text} "
-            f"(selected window ±{half_window:.3g} Hz)"
+            f"(fit window {display_f[0]:,.1f}–{display_f[-1]:,.1f} Hz)"
         )
         if show_msg:
             QMessageBox.information(self, "복소 공진 fitting 완료", self.fit_result_label.text())
@@ -2879,6 +3174,11 @@ class MainWindow(QMainWindow):
         actual_a, actual_b = self._parse_pair(self.metadata_actual_pressure_edit.text())
         particle_min, particle_max = self._parse_size_range(self.metadata_particle_size_edit.text())
         pressure_source = self.metadata_pressure_source_combo.currentText()
+        if self.pressure_monitor_btn.isChecked():
+            self._expire_pressure_sample()
+            actual_a = self.measured_pressure_a if self.measured_pressure_a is not None else np.nan
+            actual_b = self.measured_pressure_b if self.measured_pressure_b is not None else np.nan
+            pressure_source = "ITV0050 monitor / NI AI / nominal conversion"
         try:
             temperature = float(self.metadata_temperature_edit.text())
         except ValueError:
@@ -2921,12 +3221,27 @@ class MainWindow(QMainWindow):
             "Measured_pressure_B_kPa": actual_b,
             "Measured_differential_pressure_kPa": (actual_a - actual_b if np.isfinite(actual_a) and np.isfinite(actual_b) else np.nan),
             "Pressure_source": pressure_source,
+            "Pressure_monitor_channels": f"{DAQ_DEVICE}/ai0:1 (A, B); RSE; +/-10 V",
+            "Pressure_monitor_conversion": "kPa = 1 + (V - 1) * 899 / 4; valid 1..5 V; uncalibrated",
+            "Pressure_monitor_logging": "Latest host reading (~5 Hz), repeated per received demod batch; not hardware synchronized; blank on error or age >1 s",
+            "Pressure_monitor_events": [],
             "Temperature_C": temperature,
             "Temperature_source": "manual input" if np.isfinite(temperature) else "not recorded",
             "Effective_travel_distance_mm": self.metadata_distance_spin.value(),
         }
 
     def _reset_plotter_logs(self):
+        if self.plotter_spool is not None:
+            self.plotter_spool.discard()
+        self.plotter_spool = PlotterSpool()
+        self.calibration_t, self.calibration_f = [], []
+        self._calibration_sample_index = 0
+        self.analysis_t, self.analysis_f = [], []
+        self._analysis_sample_index = 0
+        self._display_sample_index = 0
+        self._log_sample_index = 0
+        self._recent_raw_dt_s = []
+        self._last_raw_t = None
         self.plot_t, self.plot_R, self.plot_theta, self.plot_f, self.plot_x, self.plot_y = \
             [], [], [], [], [], []
         self.log_t, self.log_R, self.log_theta, self.log_f, self.log_x, self.log_y = \
@@ -2942,6 +3257,8 @@ class MainWindow(QMainWindow):
 
     def reset_live_particle_detector(self, *_args):
         """Clear live results and start a fresh particle-free calibration."""
+        self.calibration_t, self.calibration_f = [], []
+        self._calibration_sample_index = 0
         self.live_particle_generation += 1
         self.live_particle_thresholds = None
         self.live_particle_events = []
@@ -2950,6 +3267,7 @@ class MainWindow(QMainWindow):
         self.live_event_list.clear()
         self.live_event_list.addItem("검출된 후보가 여기에 실시간으로 표시됩니다.")
         self.live_particle_markers.setData([], [])
+        self.live_filtered_frequency_curve.setData([], [])
         self.live_count_value.setText("0")
         self.live_latest_value.setText("—")
         self.live_export_btn.setEnabled(False)
@@ -2978,7 +3296,7 @@ class MainWindow(QMainWindow):
         if not self.live_particle_enabled.isChecked() or self.baseline_active or len(self.log_t) < 30:
             return
         warmup = self.live_calibration_spin.value()
-        start_t = float(self.log_t[0])
+        start_t = self.calibration_t[0] if self.calibration_t else float(self.log_t[0])
         elapsed = max(0.0, latest_t - start_t)
         if self.live_particle_thresholds is None:
             progress = min(100, int(round(100.0 * elapsed / warmup)))
@@ -3000,9 +3318,9 @@ class MainWindow(QMainWindow):
         margin = .60
         if self.live_particle_thresholds is None:
             right_t = start_t + warmup
-            right = int(np.searchsorted(self.log_t, right_t, side='right'))
-            time_s = np.asarray(self.log_t[:right], dtype=float)
-            frequency_hz = np.asarray(self.log_f[:right], dtype=float)
+            time_s, frequency_hz = self._read_initial_calibration(right_t)
+            if len(time_s) < 30:
+                return
             settings = ParticleSettings(
                 widths=widths, reference_start=start_t + margin,
                 reference_end=right_t - margin,
@@ -3011,9 +3329,11 @@ class MainWindow(QMainWindow):
             )
         else:
             segment_start = max(start_t, latest_t - 20.0)
-            left = int(np.searchsorted(self.log_t, segment_start, side='left'))
-            time_s = np.asarray(self.log_t[left:], dtype=float)
-            frequency_hz = np.asarray(self.log_f[left:], dtype=float)
+            left = bisect_left(self.analysis_t, segment_start)
+            time_s = np.asarray(self.analysis_t[left:], dtype=float)
+            frequency_hz = np.asarray(self.analysis_f[left:], dtype=float)
+            if len(time_s) < 30:
+                return
             analyze_end = latest_t - margin
             analyze_start = max(float(time_s[0]) + margin,
                                 self.live_particle_last_analyzed_s - 0.35)
@@ -3025,12 +3345,21 @@ class MainWindow(QMainWindow):
                 floor_hz=self.live_floor_spin.value(),
             )
         worker = LiveParticleAnalysisWorker(
-            time_s, frequency_hz, settings, self.live_particle_thresholds)
+            time_s, frequency_hz, settings, self.live_particle_thresholds,
+            savgol={"enabled": self.live_savgol_enabled.isChecked(),
+                    "window_length": self.live_savgol_window_spin.value(),
+                    "polyorder": self.live_savgol_order_spin.value()})
         worker.generation = self.live_particle_generation
         worker.completed.connect(self.on_live_particle_analysis)
         worker.failed.connect(self.on_live_particle_failed)
         self.live_particle_worker = worker
         worker.start()
+
+    def _read_initial_calibration(self, right_t):
+        """Use the bounded first blank interval after the live logs roll."""
+        right = bisect_left(self.calibration_t, right_t)
+        return (np.asarray(self.calibration_t[:right], float),
+                np.asarray(self.calibration_f[:right], float))
 
     def on_live_particle_analysis(self, payload):
         worker = self.sender()
@@ -3042,8 +3371,12 @@ class MainWindow(QMainWindow):
             self.live_calibration_progress.setFormat("blank 학습 완료 · 실시간 감시 중")
             self.live_state_value.setText("감시 중")
             threshold_text = min(row['threshold_hz'] for row in self.live_particle_thresholds)
+            sg_window = payload.get("savgol_window_samples", 0)
+            sg_ms = payload.get("savgol_effective_window_ms", 0)
+            sg_text = (f" · SG {sg_window}표본 ≈ {sg_ms:.2f} ms" if sg_window else
+                       " · SG 미적용" if self.live_savgol_enabled.isChecked() else "")
             self.live_detector_status.setText(
-                f"검출 준비 완료 · short 깊이 기준 · 적용 문턱 {threshold_text:.3g} Hz"
+                f"검출 준비 완료 · short 깊이 기준 · 적용 문턱 {threshold_text:.3g} Hz{sg_text}"
             )
             return
 
@@ -3059,9 +3392,14 @@ class MainWindow(QMainWindow):
             )
             if duplicate:
                 continue
-            index = int(np.searchsorted(self.log_t, event['time_s']))
-            index = min(max(index, 0), len(self.log_f) - 1)
-            event = dict(event, frequency_hz=float(self.log_f[index]),
+            index = bisect_left(self.analysis_t, event['time_s'])
+            index = min(max(index, 0), len(self.analysis_f) - 1)
+            event = dict(event, frequency_hz=float(self.analysis_f[index]),
+                         savgol_enabled=int(self.live_savgol_enabled.isChecked()),
+                         savgol_window_length=self.live_savgol_window_spin.value(),
+                         savgol_polyorder=self.live_savgol_order_spin.value(),
+                         savgol_window_samples=payload.get("savgol_window_samples", 0),
+                         savgol_effective_window_ms=payload.get("savgol_effective_window_ms", 0),
                          detected_at_local=datetime.now().astimezone().isoformat(timespec='milliseconds'))
             self.live_particle_events.append(event)
             new_events.append(event)
@@ -3117,7 +3455,9 @@ class MainWindow(QMainWindow):
         fields = ["event_index", "time_s", "peak_time_s", "event_start_s", "event_end_s",
                   "duration_s", "selection_source", "frequency_hz", "depth_hz", "contrast_hz",
                   "width_s", "family", "reference_ratio", "detection_threshold_hz",
-                  "local_max_jump_hz", "quality", "detected_at_local"]
+                  "local_max_jump_hz", "quality", "savgol_enabled", "savgol_window_length",
+                  "savgol_polyorder", "savgol_window_samples", "savgol_effective_window_ms",
+                  "detected_at_local"]
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fields, extrasaction='ignore')
@@ -3132,16 +3472,22 @@ class MainWindow(QMainWindow):
         if not self.hf:
             return
         self.baseline_active = bool(baseline)
-        self._reset_plotter_logs()
+        try:
+            self._reset_plotter_logs()
+        except OSError as exc:
+            QMessageBox.critical(self, "기록 파일 오류", str(exc))
+            return
         self.baseline_analysis_result = None
         self.baseline_analysis_source = None
         self.plotter_actual_rate_hz = np.nan
         self.plotter_actual_rate_label.setText("실제 적용: 연결 중...")
         self._last_plotter_ui_update_t = -np.inf
         self._last_baseline_ui_update_t = -np.inf
+        self._last_filtered_ui_update_t = -np.inf
         self.measurement_metadata = self._capture_measurement_metadata(self.baseline_active)
         self.plotter_freq_curve.setData([], [])
         self.plotter_r_curve.setData([], [])
+        self.live_filtered_frequency_curve.setData([], [])
         self.baseline_raw_curve.setData([], [])
         self.baseline_trend_curve.setData([], [])
         self.baseline_residual_curve.setData([], [])
@@ -3172,7 +3518,7 @@ class MainWindow(QMainWindow):
         if self.measurement_metadata:
             self.measurement_metadata["Measurement_end_timestamp_local"] = datetime.now().astimezone().isoformat(timespec="seconds")
             self.measurement_metadata["Received_sample_count"] = int(self.received_sample_count)
-            self.measurement_metadata["Logged_row_count"] = int(len(self.log_t))
+            self.measurement_metadata["Logged_row_count"] = int(self.plotter_spool.rows if self.plotter_spool else 0)
         self.plotter_rate_spin.setEnabled(True)
         self.plotter_start_btn.setEnabled(True)
         self.plotter_stop_btn.setEnabled(False)
@@ -3192,6 +3538,7 @@ class MainWindow(QMainWindow):
         self.baseline_active = False
 
     def _pressure_log_state(self):
+        self._expire_pressure_sample()
         channels = list(DAQ_CHANNELS.values())
         a = float(self.pressure_commands.get(channels[0], 0.0))
         b = float(self.pressure_commands.get(channels[1], 0.0))
@@ -3223,12 +3570,26 @@ class MainWindow(QMainWindow):
         phase_error = self._latest_pll_error_deg
         correction = self._latest_pll_correction_hz
         pll_latency = self._latest_pll_read_latency_s
+        rows = []
         for t, r, theta, f, x, y, poll_latency in batch:
-            self._record_plotter_sample(
+            rows.append(self._record_plotter_sample(
                 t, r, theta, f, x, y, locked, phase_error, correction,
                 poll_latency, pll_latency,
-            )
+            ))
+        try:
+            self.plotter_spool.append(rows)
+        except OSError as exc:
+            self.on_plotter_failed(f"임시 기록 파일에 쓸 수 없습니다: {exc}")
+            return
+        batch_times = np.fromiter((row[1] for row in rows), dtype=float)
+        if self._last_raw_t is not None:
+            self._recent_raw_dt_s.append(float(batch_times[0] - self._last_raw_t))
+        self._recent_raw_dt_s.extend(np.diff(batch_times).tolist())
+        if len(self._recent_raw_dt_s) > 10000:
+            del self._recent_raw_dt_s[:-10000]
+        self._last_raw_t = float(batch_times[-1])
         latest_t = batch[-1][0]
+        self._trim_live_logs(latest_t)
         self._schedule_live_particle_analysis(latest_t)
         if latest_t - self._last_plotter_ui_update_t >= 0.05:
             self._last_plotter_ui_update_t = latest_t
@@ -3242,38 +3603,89 @@ class MainWindow(QMainWindow):
         switch_event = int(self._switch_event_pending)
         self._switch_event_pending = False
 
-        self.plot_t.append(t)
-        self.plot_R.append(r)
-        self.plot_theta.append(theta)
-        self.plot_f.append(f)
-        self.plot_x.append(x)
-        self.plot_y.append(y)
+        display_stride = max(1, int(np.ceil(self.plotter_actual_rate_hz *
+                                            self.plotter_window_spin.value() / LIVE_LOG_MAX_ROWS))) if np.isfinite(self.plotter_actual_rate_hz) else 1
+        if self._display_sample_index % display_stride == 0:
+            self.plot_t.append(t)
+            self.plot_R.append(r)
+            self.plot_theta.append(theta)
+            self.plot_f.append(f)
+            self.plot_x.append(x)
+            self.plot_y.append(y)
+        self._display_sample_index += 1
 
-        self.log_t.append(t)
-        self.log_R.append(r)
-        self.log_theta.append(theta)
-        self.log_f.append(f)
-        self.log_x.append(x)
-        self.log_y.append(y)
-        self.log_pll_target_phase.append(self.pll_setpoint_spin.value())
-        self.log_pll_phase_error.append(phase_error)
-        self.log_pll_frequency_command.append(f)
-        self.log_pll_correction.append(correction)
-        self.log_pll_locked.append(int(locked))
-        self.log_pressure_a.append(pressure_a)
-        self.log_pressure_b.append(pressure_b)
-        self.log_flow_direction.append(flow_direction)
-        self.log_switch_state.append(switch_state)
-        self.log_switch_event.append(switch_event)
-        self.log_measured_pressure_a.append(self.measured_pressure_a)
-        self.log_measured_pressure_b.append(self.measured_pressure_b)
-        self.log_temperature_c.append(self.temperature_c)
-        self.log_demod_read_latency_s.append(demod_latency)
-        self.log_pll_read_latency_s.append(pll_latency)
-        self.log_pll_status_age_s.append(
+        analysis_stride = max(1, int(np.ceil(self.plotter_actual_rate_hz / 4000))) if np.isfinite(self.plotter_actual_rate_hz) else 1
+        if self._analysis_sample_index % analysis_stride == 0:
+            self.analysis_t.append(t)
+            self.analysis_f.append(f)
+        self._analysis_sample_index += 1
+
+        pll_status_age = (
             time.monotonic() - self._latest_pll_status_monotonic
             if np.isfinite(self._latest_pll_status_monotonic) else np.nan
         )
+        log_stride = max(1, int(np.ceil(self.plotter_actual_rate_hz *
+                                        LIVE_LOG_WINDOW_S / LIVE_LOG_MAX_ROWS))) if np.isfinite(self.plotter_actual_rate_hz) else 1
+        if self._log_sample_index % log_stride == 0:
+            self.log_t.append(t)
+            self.log_R.append(r)
+            self.log_theta.append(theta)
+            self.log_f.append(f)
+            self.log_x.append(x)
+            self.log_y.append(y)
+            self.log_pll_target_phase.append(self.pll_setpoint_spin.value())
+            self.log_pll_phase_error.append(phase_error)
+            self.log_pll_frequency_command.append(f)
+            self.log_pll_correction.append(correction)
+            self.log_pll_locked.append(int(locked))
+            self.log_pressure_a.append(pressure_a)
+            self.log_pressure_b.append(pressure_b)
+            self.log_flow_direction.append(flow_direction)
+            self.log_switch_state.append(switch_state)
+            self.log_switch_event.append(switch_event)
+            self.log_measured_pressure_a.append(self.measured_pressure_a)
+            self.log_measured_pressure_b.append(self.measured_pressure_b)
+            self.log_temperature_c.append(self.temperature_c)
+            self.log_demod_read_latency_s.append(demod_latency)
+            self.log_pll_read_latency_s.append(pll_latency)
+            self.log_pll_status_age_s.append(pll_status_age)
+        self._log_sample_index += 1
+        if not self.baseline_active and self.live_particle_thresholds is None:
+            # Match the live detection stream's effective sample rate so one
+            # SG window_length means the same thing for blank and events.
+            if self._calibration_sample_index % analysis_stride == 0 and len(self.calibration_t) < 250000:
+                self.calibration_t.append(t)
+                self.calibration_f.append(f)
+            self._calibration_sample_index += 1
+        pa, pb = self.measured_pressure_a, self.measured_pressure_b
+        dp = float(pa) - float(pb) if pa is not None and pb is not None else ""
+        return [
+            self.measurement_metadata.get("SessionID", ""), t, f, r, theta, x, y,
+            self.pll_setpoint_spin.value(), phase_error, f, correction, int(locked),
+            pll_status_age, pressure_a, pressure_b, flow_direction,
+            switch_state, switch_event, pa, pb, dp, self.temperature_c,
+            demod_latency, pll_latency,
+        ]
+
+    def _trim_live_logs(self, latest_t):
+        # Keep enough recent raw samples for live calibration and diagnostics.
+        expired = max(bisect_left(self.log_t, latest_t - LIVE_LOG_WINDOW_S),
+                      len(self.log_t) - LIVE_LOG_MAX_ROWS)
+        if expired > 0:
+            for name in (
+                "log_t", "log_R", "log_theta", "log_f", "log_x", "log_y",
+                "log_pll_target_phase", "log_pll_phase_error", "log_pll_frequency_command",
+                "log_pll_correction", "log_pll_locked", "log_pressure_a", "log_pressure_b",
+                "log_flow_direction", "log_switch_state", "log_switch_event",
+                "log_measured_pressure_a", "log_measured_pressure_b", "log_temperature_c",
+                "log_demod_read_latency_s", "log_pll_read_latency_s", "log_pll_status_age_s",
+            ):
+                del getattr(self, name)[:expired]
+        analysis_expired = max(bisect_left(self.analysis_t, latest_t - 25.0),
+                               len(self.analysis_t) - 100000)
+        if analysis_expired > 0:
+            del self.analysis_t[:analysis_expired]
+            del self.analysis_f[:analysis_expired]
 
     def _refresh_plotter_ui(self, t):
         refresh_started = time.perf_counter()
@@ -3282,7 +3694,7 @@ class MainWindow(QMainWindow):
         # At multi-kSa/s rates, repeated pop(0) shifts the full list once per
         # expired sample and can starve the GUI thread. Find the boundary once
         # and remove the expired prefix from all display buffers in bulk.
-        expired = bisect_left(self.plot_t, cutoff)
+        expired = max(bisect_left(self.plot_t, cutoff), len(self.plot_t) - LIVE_LOG_MAX_ROWS)
         if expired:
             for values in (
                 self.plot_t, self.plot_R, self.plot_theta,
@@ -3291,12 +3703,34 @@ class MainWindow(QMainWindow):
                 del values[:expired]
 
         # Rendering hundreds of thousands of points at 20 Hz can dominate the
-        # GUI thread.  Preserve the full display-window buffers for statistics,
-        # but decimate only the visual representation.
+        # GUI thread. Keep a bounded sample of the requested display window,
+        # then decimate its visual representation further.
         display_stride = max(1, len(self.plot_t) // 5000)
         self.plotter_freq_curve.setData(self.plot_t[::display_stride], self.plot_f[::display_stride])
         self.plotter_r_curve.setData(self.plot_t[::display_stride], self.plot_R[::display_stride])
         self.live_frequency_curve.setData(self.plot_t[::display_stride], self.plot_f[::display_stride])
+        if (self.live_savgol_enabled.isChecked() and
+                t - self._last_filtered_ui_update_t >= 0.20):
+            self._last_filtered_ui_update_t = t
+            # Use the detector stream (up to 4 kSa/s), rather than the more
+            # aggressively decimated drawing buffer, so this has the same
+            # sample-count meaning as the signal passed to detection. Keep
+            # the complete requested time window so the trace scrolls
+            # continuously instead of replacing a short 5,000-sample tail.
+            preview_start = bisect_left(self.analysis_t, cutoff)
+            preview_t = np.asarray(self.analysis_t[preview_start:], dtype=float)
+            preview_f = np.asarray(self.analysis_f[preview_start:], dtype=float)
+            if len(preview_t) >= self.live_savgol_window_spin.value():
+                try:
+                    filtered, _ = filter_frequency(
+                        preview_t, preview_f, enabled=True,
+                        window_length=self.live_savgol_window_spin.value(),
+                        polyorder=self.live_savgol_order_spin.value())
+                    preview_stride = max(1, len(preview_t) // 2500)
+                    self.live_filtered_frequency_curve.setData(
+                        preview_t[::preview_stride], filtered[::preview_stride])
+                except ValueError:
+                    self.live_filtered_frequency_curve.setData([], [])
         if self.plot_f:
             self.live_frequency_value.setText(f"{self.plot_f[-1]:,.3f} Hz")
         self._update_live_particle_markers()
@@ -3321,12 +3755,14 @@ class MainWindow(QMainWindow):
             self.plotter_std_label.setText(
                 f"Std ({self.hist_channel_combo.currentText()}): {std:.6g}   Mean: {mean:.6g}   N={len(arr)}"
             )
-        # Full-session fitting is intentionally slower than the live Plotter.
-        # Raw logging remains at the device stream rate.
+        # Recent-window fitting is intentionally slower than the live Plotter.
+        # Disk logging remains at the device stream rate.
         if self.baseline_active and t - self._last_baseline_ui_update_t >= 1.0:
             self._last_baseline_ui_update_t = t
             self._update_baseline_analysis()
         self.ui_refresh_durations_s.append(time.perf_counter() - refresh_started)
+        if len(self.ui_refresh_durations_s) > 10000:
+            del self.ui_refresh_durations_s[:5000]
 
     def _update_baseline_analysis(self):
         n = len(self.log_t)
@@ -3373,7 +3809,7 @@ class MainWindow(QMainWindow):
             else 1.0 / self.plotter_rate_spin.value()
         )
         self._run_baseline_analysis_source({
-            "name": "current in-memory raw Plotter log", "metadata": dict(self.measurement_metadata),
+            "name": "recent bounded Plotter analysis window", "metadata": dict(self.measurement_metadata),
             "time_s": np.asarray(self.log_t, float), "frequency_hz": np.asarray(self.log_f, float),
             "amplitude_v": np.asarray(self.log_R, float), "phase_deg": np.asarray(self.log_theta, float),
             "phase_error_deg": np.asarray(self.log_pll_phase_error, float),
@@ -3469,6 +3905,7 @@ class MainWindow(QMainWindow):
         self.baseline_analysis_btn.setText("Baseline 상세 분석 실행 (현재 raw 기록)")
         self.baseline_summary_export_btn.setEnabled(True)
         self.baseline_derived_export_btn.setEnabled(True)
+        self.baseline_allan_export_btn.setEnabled(bool(result["allan"]))
         self.event_export_btn.setEnabled(True)
         timing = result["timing"]
         candidates = result["particle_candidates"].get("candidates", [])
@@ -3544,6 +3981,25 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "저장 완료", f"Summary 저장됨: {path}")
         except Exception as exc:
             QMessageBox.critical(self, "저장 오류", str(exc))
+
+    def export_baseline_allan(self):
+        result = self.baseline_analysis_result
+        if not result or not result.get("allan"):
+            QMessageBox.information(self, "Allan 저장", "먼저 충분한 baseline 데이터를 분석하세요.")
+            return
+        source = self.baseline_analysis_source or {}
+        session_id = source.get("metadata", self.measurement_metadata).get("SessionID", "unknown")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Allan deviation 그래프·수치 저장", f"allan_{session_id}.csv", "CSV Files (*.csv)")
+        if not path:
+            return
+        sensitivity = self.allan_sensitivity_spin.value() or None
+        try:
+            csv_path, png_path = save_allan_export(path, result["allan"], sensitivity)
+            unit = "µg (입력한 질량 감도 적용)" if sensitivity is not None else "Hz"
+            QMessageBox.information(self, "저장 완료", f"Allan y축: {unit}\nCSV: {csv_path}\nPNG: {png_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Allan 저장 오류", str(exc))
 
     def export_baseline_derived_csv(self):
         result = self.baseline_analysis_result
@@ -3621,7 +4077,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Plotter 오류", msg)
 
     def export_plotter_csv(self):
-        if len(self.log_t) == 0:
+        if self.plotter_spool is None or self.plotter_spool.rows == 0:
             QMessageBox.information(self, "저장할 데이터 없음", "먼저 Plotter를 실행하세요.")
             return
         session_id = self.measurement_metadata.get("SessionID", time.strftime('%Y%m%d_%H%M%S'))
@@ -3631,46 +4087,22 @@ class MainWindow(QMainWindow):
             return
         try:
             self._write_raw_csv(path)
-            QMessageBox.information(self, "저장 완료", f"저장됨: {path}\n({len(self.log_t)} 포인트)")
+            QMessageBox.information(self, "저장 완료", f"저장됨: {path}\n({self.plotter_spool.rows} 포인트)")
         except Exception as e:
             QMessageBox.critical(self, "저장 오류", str(e))
 
     def _write_raw_csv(self, path):
         metadata = dict(self.measurement_metadata)
         metadata["Received_sample_count"] = int(self.received_sample_count)
-        metadata["Logged_row_count"] = int(len(self.log_t))
-        if len(self.log_t) >= 2:
-            elapsed = np.diff(np.asarray(self.log_t, dtype=float))
+        metadata["Logged_row_count"] = int(self.plotter_spool.rows if self.plotter_spool else 0)
+        if self._recent_raw_dt_s:
+            elapsed = np.asarray(self._recent_raw_dt_s, dtype=float)
             elapsed = elapsed[elapsed > 0]
             if len(elapsed):
                 metadata["Actual_sampling_rate_Hz"] = 1.0 / float(np.median(elapsed))
-        session_id = metadata.get("SessionID", "")
-        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
-            writer = csv.writer(handle)
-            for key, value in metadata.items():
-                writer.writerow(["# Metadata", key, value])
-            writer.writerow([
-                "SessionID", "Time_s", "Frequency_Hz", "Amplitude_R_V", "Phase_deg", "X_V", "Y_V",
-                "PLL_TargetPhase_deg", "PLL_PhaseError_deg", "PLL_FrequencyCommand_Hz",
-                "PLL_Correction_Hz", "PLL_LockStatus", "PLLStatusAge_s",
-                "PressureCommand_A_V", "PressureCommand_B_V", "FlowDirection", "SwitchState", "SwitchEvent",
-                "MeasuredPressure_A_kPa", "MeasuredPressure_B_kPa", "MeasuredDifferentialPressure_kPa",
-                "Temperature_C", "DemodReadLatency_s", "PLLReadLatency_s",
-            ])
-            n = len(self.log_t)
-            for i in range(n):
-                pa = self.log_measured_pressure_a[i]
-                pb = self.log_measured_pressure_b[i]
-                dp = (float(pa) - float(pb) if pa is not None and pb is not None else "")
-                writer.writerow([
-                    session_id, self.log_t[i], self.log_f[i], self.log_R[i], self.log_theta[i],
-                    self.log_x[i], self.log_y[i], self.log_pll_target_phase[i],
-                    self.log_pll_phase_error[i], self.log_pll_frequency_command[i],
-                    self.log_pll_correction[i], self.log_pll_locked[i], self.log_pll_status_age_s[i],
-                    self.log_pressure_a[i], self.log_pressure_b[i], self.log_flow_direction[i],
-                    self.log_switch_state[i], self.log_switch_event[i], pa, pb, dp,
-                    self.log_temperature_c[i], self.log_demod_read_latency_s[i], self.log_pll_read_latency_s[i],
-                ])
+        if self.plotter_spool is None:
+            raise OSError("Plotter 임시 기록 파일이 없습니다.")
+        self.plotter_spool.export(path, metadata)
 
     def compare_baseline_files(self):
         baseline_paths, _ = QFileDialog.getOpenFileNames(
@@ -3699,12 +4131,21 @@ class MainWindow(QMainWindow):
             expected_pll_update_s = 1.0 / float(pll_rate) if float(pll_rate) > 0 else 0.25
         except (TypeError, ValueError):
             expected_pll_update_s = 0.25
-        return integration_diagnostics(
-            self.log_t, self.received_sample_count, self.log_pll_status_age_s,
+        result = integration_diagnostics(
+            self.log_t, len(self.log_t), self.log_pll_status_age_s,
             self.log_demod_read_latency_s, self.log_pressure_a, self.log_pressure_b,
             self.log_measured_pressure_a, self.log_measured_pressure_b,
             expected_pll_update_s, self.ui_refresh_durations_s, 0.05,
         )
+        spooled = self.plotter_spool.rows if self.plotter_spool else 0
+        result["raw_recording"] = {
+            "received_samples": self.received_sample_count,
+            "temporary_file_rows": spooled,
+            "pass": self.received_sample_count == spooled,
+        }
+        result["analysis_window"] = "Recent sampled window; full acquisition is in the temporary CSV."
+        result["checks"]["overall_pass"] &= result["raw_recording"]["pass"]
+        return result
 
     def export_integration_report(self):
         if not self.log_t:
@@ -3970,10 +4411,24 @@ class MainWindow(QMainWindow):
 
     # --- cleanup ---
     def closeEvent(self, event):
+        if self.pressure_worker is not None:
+            self.pressure_worker.requestInterruption()
+            if not self.pressure_worker.wait(1000):
+                self.pressure_readback_label.setText("DAQ 응답 대기 중: 압력 읽기 종료 후 다시 닫아주세요.")
+                event.ignore()
+                return
+        self.pressure_watchdog.stop()
+        try:
+            self._save_last_settings()
+        except OSError as exc:
+            print(f"Last settings could not be saved: {exc}", file=sys.stderr)
         try:
             self.emergency_stop()
         except Exception:
             pass
+        if self.plotter_spool is not None:
+            self.plotter_spool.discard()
+            self.plotter_spool = None
         if self.hf:
             self.hf.close()
         event.accept()

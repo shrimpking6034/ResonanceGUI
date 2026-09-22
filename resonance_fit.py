@@ -19,6 +19,7 @@ class ResonanceFit:
     success: bool
     message: str
     parameters: np.ndarray
+    resonance_sign: int = 1
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,29 @@ def detect_resonance_peaks(frequency_hz, amplitude):
     return indices, widths * abs(spacing), smooth, noise_sigma
 
 
+def three_db_bounds(frequency_hz, smoothed_amplitude, peak_index):
+    """Interpolate absolute -3 dB crossings; return None if either is missing.
+
+    A prominence half-width differs from -3 dB when a background is present.
+    """
+    f = np.asarray(frequency_hz, dtype=float)
+    r = np.asarray(smoothed_amplitude, dtype=float)
+    p = int(peak_index)
+    if (len(f) != len(r) or p <= 0 or p >= len(f) - 1 or
+            not np.all(np.diff(f) > 0) or not np.all(np.isfinite(r)) or r[p] <= 0):
+        return None
+    level = r[p] / np.sqrt(2.0)
+    left = np.flatnonzero(r[:p] <= level)
+    right = np.flatnonzero(r[p + 1:] <= level)
+    if not len(left) or not len(right):
+        return None
+    li = int(left[-1])
+    ri = int(p + 1 + right[0])
+    left_hz = float(np.interp(level, r[li:li + 2], f[li:li + 2]))
+    right_hz = float(np.interp(level, r[ri - 1:ri][::-1], f[ri - 1:ri][::-1]))
+    return left_hz, right_hz
+
+
 def assess_fit_quality(frequency_hz, x, y, fit, min_linewidth_bins=3.0,
                        min_complex_r_squared=0.80):
     """Return conservative diagnostics for using a fit in PLL design."""
@@ -76,13 +100,19 @@ def assess_fit_quality(frequency_hz, x, y, fit, min_linewidth_bins=3.0,
 
     spacing = float(np.median(np.diff(np.unique(np.sort(f)))))
     linewidth_bins = float(fit.linewidth_hz / spacing) if spacing > 0 else 0.0
-    model = model_response(f, fit.parameters, float(np.mean(f)))
+    model = model_response(f, fit.parameters, float(np.mean(f)), fit.resonance_sign)
     residual_power = float(np.sum(np.abs(model - z) ** 2))
     signal_power = float(np.sum(np.abs(z - np.mean(z)) ** 2))
     normalized_rmse = float(np.sqrt(residual_power / max(signal_power, np.finfo(float).tiny)))
     complex_r_squared = float(1.0 - residual_power / max(signal_power, np.finfo(float).tiny))
 
     reasons = []
+    observed_span = float(np.ptp(f))
+    if not np.isfinite(fit.linewidth_hz) or fit.linewidth_hz <= 0 or fit.linewidth_hz > observed_span:
+        reasons.append(
+            f"피팅 선폭 {fit.linewidth_hz:.3g} Hz가 측정 구간 {observed_span:.3g} Hz보다 넓어 "
+            "공진 곡률을 확인할 수 없습니다. 공진 주변을 더 넓게 스윕하세요."
+        )
     if linewidth_bins < min_linewidth_bins:
         target_step = fit.linewidth_hz / 5.0
         reasons.append(
@@ -102,20 +132,31 @@ def assess_fit_quality(frequency_hz, x, y, fit, min_linewidth_bins=3.0,
                                complex_r_squared, tuple(reasons))
 
 
-def model_response(frequency_hz, parameters, center_hz=None):
-    """Complex background plus an exact second-order driven resonance."""
+def model_response(frequency_hz, parameters, center_hz=None, resonance_sign=1):
+    """Complex background plus a resonance in either I/Q convention.
+
+    The denominator sign is +1 for decreasing resonance phase and -1 for
+    increasing resonance phase. The complex background can alter the total
+    response's local phase slope. The default preserves the legacy convention.
+    """
+    if resonance_sign not in (-1, 1):
+        raise ValueError("resonance_sign must be +1 or -1")
     f = np.asarray(frequency_hz, dtype=float)
     f0, log_q, ar, ai, b0r, b0i, b1r, b1i = parameters
     q = np.exp(log_q)
     center_hz = f0 if center_hz is None else center_hz
-    resonance = (ar + 1j * ai) / (1.0 - (f / f0) ** 2 + 1j * f / (q * f0))
+    resonance = (ar + 1j * ai) / (1.0 - (f / f0) ** 2 + resonance_sign * 1j * f / (q * f0))
     background = (b0r + 1j * b0i) + (b1r + 1j * b1i) * (f - center_hz)
     return resonance + background
 
 
 def fit_complex_resonance(frequency_hz, x, y, x_sem=None, y_sem=None,
                           f0_guess=None, f0_bounds=None):
-    """Fit one complex resonance.
+    """Fit one complex resonance, automatically selecting its I/Q convention.
+
+    Both denominator signs are compared using weighted least-squares cost
+    before robust refinement. Data, fitted phase, and phase slope remain in
+    the original measurement coordinates.
 
     ``f0_guess`` and ``f0_bounds`` make a user-selected peak an explicit
     fitting constraint.  Without them a broad multi-mode sweep naturally
@@ -171,8 +212,8 @@ def fit_complex_resonance(frequency_hz, x, y, x_sem=None, y_sem=None,
     sx = np.maximum(sx, amplitude_scale * 1e-9)
     sy = np.maximum(sy, amplitude_scale * 1e-9)
 
-    def residuals(p):
-        model = model_response(f, p, center)
+    def residuals(p, resonance_sign):
+        model = model_response(f, p, center, resonance_sign)
         return np.concatenate(((model.real - z.real) / sx, (model.imag - z.imag) / sy))
 
     # Q and the complex background are correlated.  Starting a robust loss
@@ -186,17 +227,20 @@ def fit_complex_resonance(frequency_hz, x, y, x_sem=None, y_sem=None,
                         amplitude_scale, amplitude_scale, amplitude_scale, amplitude_scale,
                         amplitude_scale / max(span, 1.0), amplitude_scale / max(span, 1.0)])
     preliminary = None
-    for q_seed in q_seeds:
-        start = p0.copy()
-        start[1] = np.clip(np.log(q_seed), lower[1] + 1e-12, upper[1] - 1e-12)
-        candidate = least_squares(
-            residuals, start, bounds=(lower, upper), loss="linear",
-            max_nfev=5000, x_scale=x_scale,
-        )
-        if preliminary is None or candidate.cost < preliminary.cost:
-            preliminary = candidate
+    selected_sign = 1
+    for resonance_sign in (1, -1):
+        for q_seed in q_seeds:
+            start = p0.copy()
+            start[1] = np.clip(np.log(q_seed), lower[1] + 1e-12, upper[1] - 1e-12)
+            candidate = least_squares(
+                residuals, start, args=(resonance_sign,), bounds=(lower, upper), loss="linear",
+                max_nfev=5000, x_scale=x_scale,
+            )
+            if preliminary is None or candidate.cost < preliminary.cost:
+                preliminary = candidate
+                selected_sign = resonance_sign
 
-    preliminary_residuals = residuals(preliminary.x)
+    preliminary_residuals = residuals(preliminary.x, selected_sign)
     residual_center = float(np.median(preliminary_residuals))
     residual_sigma = float(
         1.4826 * np.median(np.abs(preliminary_residuals - residual_center))
@@ -204,14 +248,13 @@ def fit_complex_resonance(frequency_hz, x, y, x_sem=None, y_sem=None,
     residual_rms = float(np.sqrt(np.mean(preliminary_residuals ** 2)))
     robust_scale = max(residual_sigma, 0.05 * residual_rms, np.finfo(float).eps)
     result = least_squares(
-        residuals, preliminary.x, bounds=(lower, upper), loss="soft_l1",
+        residuals, preliminary.x, args=(selected_sign,), bounds=(lower, upper), loss="soft_l1",
         f_scale=robust_scale, max_nfev=5000, x_scale=x_scale,
     )
     p = result.x
     q = float(np.exp(p[1]))
-    model = model_response(f, p, center)
     dof = max(1, 2 * len(f) - len(p))
-    chi2 = float(np.sum(residuals(p) ** 2) / dof)
+    chi2 = float(np.sum(residuals(p, selected_sign) ** 2) / dof)
     covariance = np.full((len(p), len(p)), np.nan)
     try:
         covariance = np.linalg.pinv(result.jac.T @ result.jac) * chi2
@@ -220,10 +263,11 @@ def fit_complex_resonance(frequency_hz, x, y, x_sem=None, y_sem=None,
     f0_std = float(np.sqrt(max(covariance[0, 0], 0))) if np.isfinite(covariance[0, 0]) else float("nan")
     q_std = float(q * np.sqrt(max(covariance[1, 1], 0))) if np.isfinite(covariance[1, 1]) else float("nan")
     df = max(abs(p[0]) * 1e-7, span * 1e-6)
-    z_minus = model_response(np.array([p[0] - df]), p, center)[0]
-    z_plus = model_response(np.array([p[0] + df]), p, center)[0]
+    z_minus = model_response(np.array([p[0] - df]), p, center, selected_sign)[0]
+    z_plus = model_response(np.array([p[0] + df]), p, center, selected_sign)[0]
     phase_slope = np.angle(z_plus / z_minus) / (2.0 * df) * 180.0 / np.pi
-    at_resonance = model_response(np.array([p[0]]), p, center)[0]
+    at_resonance = model_response(np.array([p[0]]), p, center, selected_sign)[0]
     return ResonanceFit(float(p[0]), q, float(p[0] / q),
                         float(np.angle(at_resonance, deg=True)), float(phase_slope),
-                        f0_std, q_std, chi2, bool(result.success), result.message, p)
+                        f0_std, q_std, chi2, bool(result.success), result.message, p,
+                        selected_sign)

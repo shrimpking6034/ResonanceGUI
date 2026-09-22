@@ -18,6 +18,7 @@ dist/
 *.pkg
 
 # 임시 파일
+.resonance_state/
 .codex_tmp/
 .chart-data-*/
 tmp/
@@ -28,6 +29,7 @@ Noise Data/
 raw_*.csv
 events_*.csv
 integration_*.json
+fpga_*.csv
 
 # Particle review generated exports
 particle_graphs_*/

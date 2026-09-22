@@ -3,15 +3,39 @@ import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from particle_review_core import batch_context_noise
+from particle_review_core import batch_context_noise, local_baseline
 
 
-def analyze_noise(data, events, window_s=1.0, guard_s=.25, degree=1):
+def recompute_event_depths(data, events, signal_source='filtered'):
+    """Return event copies with depth measured consistently on ``data``."""
+    t=data.Time_s.to_numpy(dtype=float);f=data.Frequency_Hz.to_numpy(dtype=float)
+    updated=[]
+    for event in events:
+        item=dict(event);center=float(item['time_s'])
+        original=float(item.get('raw_depth_hz',item.get('depth_hz',np.nan)))
+        item['raw_depth_hz']=original
+        try:
+            baseline=local_baseline(data,center)
+            start=float(item.get('event_start_s',center));end=float(item.get('event_end_s',center))
+            mask=(t>=start)&(t<=end)
+            if not np.any(mask):raise ValueError('이벤트 구간 표본 없음')
+            item['depth_hz']=float(np.max(baseline[mask]-f[mask]))
+            item['depth_recompute_warning']=''
+        except (ValueError,TypeError) as exc:
+            item['depth_hz']=np.nan;item['depth_recompute_warning']=str(exc)
+        item['depth_signal_source']=str(signal_source)
+        updated.append(item)
+    return updated
+
+
+def analyze_noise(data, events, window_s=1.0, guard_s=.25, degree=1,
+                  signal_source='raw', recompute_depth=False):
     if not events:
         raise ValueError('분석할 후보가 없습니다.')
     contexts = batch_context_noise(data, events, window_s, guard_s, degree)
+    measured_events=recompute_event_depths(data,events,signal_source) if recompute_depth else [dict(event) for event in events]
     results, samples = [], []
-    for i, event in enumerate(events, 1):
+    for i, (event, measured_event) in enumerate(zip(events,measured_events), 1):
         rows = contexts[contexts.event_index == i].set_index('context')
         b, a = rows.loc['before'], rows.loc['after']
         warnings = []
@@ -33,7 +57,11 @@ def analyze_noise(data, events, window_s=1.0, guard_s=.25, degree=1):
                                 frequency_hz=ff, drift_hz=dd, residual_hz=ff-dd)
                            for tt, ff, dd in zip(t, f, drift))
         pooled = np.sqrt((b.sample_count*b.detrended_std_hz**2+a.sample_count*a.detrended_std_hz**2)/(b.sample_count+a.sample_count)) if b.sample_count+a.sample_count else np.nan
-        depth = abs(float(event.get('depth_hz', np.nan)))
+        saved_depth = abs(float(event.get('depth_hz', np.nan)))
+        saved_depth = abs(float(event.get('raw_depth_hz',saved_depth)))
+        depth = abs(float(measured_event.get('depth_hz',np.nan)))
+        if measured_event.get('depth_recompute_warning'):
+            warnings.append('필터 신호 Δf 재계산 불가: '+measured_event['depth_recompute_warning'])
         if not np.isfinite(pooled) or pooled<=0 or not np.isfinite(depth):
             warnings.append('SNR 계산 불가')
         if not warnings and max(b.detrended_std_hz,a.detrended_std_hz)>2*min(b.detrended_std_hz,a.detrended_std_hz):
@@ -42,6 +70,7 @@ def analyze_noise(data, events, window_s=1.0, guard_s=.25, degree=1):
             return depth/sigma if np.isfinite(sigma) and sigma>0 and np.isfinite(depth) else np.nan
         snr = ratio(pooled)
         results.append(dict(event_index=i, time_s=float(event['time_s']), depth_hz=depth,
+            saved_raw_depth_hz=saved_depth,
             review_status=event.get('status',''), note=event.get('note',''),
             sigma_before_hz=b.detrended_std_hz, sigma_after_hz=a.detrended_std_hz,
             sigma_pooled_hz=pooled, threshold_10sigma_hz=10*pooled,
@@ -52,8 +81,10 @@ def analyze_noise(data, events, window_s=1.0, guard_s=.25, degree=1):
     return dict(summary=pd.DataFrame(results), contexts=contexts,
                 residuals=pd.DataFrame(samples,columns=['event_index','context','time_s','frequency_hz','drift_hz','residual_hz']),
                 settings=dict(window_s=window_s,guard_s=guard_s,degree=degree,std_ddof=0,
-                    signal='abs(saved depth_hz)', pooled_definition='sqrt(sum(n*sigma^2)/sum(n))',
-                    detrending='separate fit per side; no smoothing or interpolation'))
+                    signal_source=str(signal_source),
+                    signal='recomputed depth on analysis signal' if recompute_depth else 'abs(saved depth_hz)',
+                    pooled_definition='sqrt(sum(n*sigma^2)/sum(n))',
+                    detrending='separate polynomial fit per side; no interpolation'))
 
 
 def save_noise_analysis(folder, analysis, source, metadata=None):
@@ -67,7 +98,7 @@ def save_noise_analysis(folder, analysis, source, metadata=None):
     contexts.to_csv(folder/'snr_context_noise.csv',index=False,encoding='utf-8-sig')
     residuals.to_csv(folder/'snr_residuals.csv',index=False,encoding='utf-8-sig')
     (folder/'snr_analysis_settings.json').write_text(json.dumps(dict(source=str(source),metadata=metadata or {},**settings),ensure_ascii=False,indent=2),encoding='utf-8')
-    lines=['# 주변 노이즈 및 SNR','',f'원본: `{source}`','',
+    lines=['# 주변 노이즈 및 SNR','',f'원본: `{source}`',f"분석 입력: `{settings.get('signal_source','raw')}`",'',
         f"전후 각각 {settings['window_s']:g}초, 중심 ±{guard:g}초 제외, 각 구간 {settings['degree']}차 drift 제거. σ는 residual 표준편차(ddof=0).",
         '통합 σ = sqrt(sum(n × σ²) / sum(n)); SNR = abs(depth_hz) / 통합 σ.', '',
         '|시각(s)|Δf(Hz)|전 σ(Hz)|후 σ(Hz)|통합 σ(Hz)|SNR|10σ|안내|',

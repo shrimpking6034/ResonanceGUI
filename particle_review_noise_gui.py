@@ -52,7 +52,8 @@ class NoisePanel(QtWidgets.QWidget):
     def set_result(self, analysis, data, source, metadata):
         self.analysis=analysis; self.data=data; self.source=source; self.metadata=metadata
         out=analysis['summary']; s=analysis['settings']
-        self.info.setText(f"{len(out)}개 후보 | 각 방향 {s['window_s']:g} s / 중심 ±{s['guard_s']:g} s 제외 / {s['degree']}차 drift\nSNR 평균 {out.snr_pooled.mean():.2f} · 중앙값 {out.snr_pooled.median():.2f} · 10σ 충족 {(out.meets_10sigma==True).sum()}개 / 유효 {out.snr_pooled.notna().sum()}개")
+        source=s.get('signal_source','raw')
+        self.info.setText(f"입력 {source} · {len(out)}개 후보 | 각 방향 {s['window_s']:g} s / 중심 ±{s['guard_s']:g} s 제외 / {s['degree']}차 drift\nSNR 평균 {out.snr_pooled.mean():.2f} · 중앙값 {out.snr_pooled.median():.2f} · 10σ 충족 {(out.meets_10sigma==True).sum()}개 / 유효 {out.snr_pooled.notna().sum()}개")
         self.table.setRowCount(len(out))
         for i,r in enumerate(out.itertuples()):
             verdict='계산 불가' if not np.isfinite(r.snr_pooled) else ('충족' if r.meets_10sigma else '미달')

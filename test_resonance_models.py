@@ -6,7 +6,7 @@ from beam_modes import TubeBeam, calculate_modes
 from sweep_math import make_filter_plan, settling_multiplier
 from resonance_fit import (fit_complex_resonance, model_response,
                            detect_resonance_peaks, assess_fit_quality,
-                           ResonanceFit)
+                           ResonanceFit, three_db_bounds)
 from pll_design import design_pll
 
 
@@ -67,6 +67,36 @@ class ResonanceModelTests(unittest.TestCase):
         self.assertGreater(fit.q, 50.0)
         self.assertTrue(quality.accepted, quality.reasons)
 
+    def test_complex_fit_preserves_both_phase_directions_and_count_units(self):
+        f = np.linspace(21050.0, 21550.0, 61)
+        center = float(np.mean(f))
+        f0, q = 21380.0, 99.0
+        # Independently construct a response, then conjugate the entire trace
+        # to simulate the opposite quadrature convention (including background).
+        z = (2.8e5 + 1.1e5j) / (1 - (f / f0) ** 2 + 1j * f / (q * f0))
+        z += 1.2e6 - 2.0e6j + (1400.0 + 900.0j) * (f - center)
+        sem = np.linspace(700.0, 1000.0, len(f))
+        for sign, observed in ((1, z), (-1, z.conjugate())):
+            with self.subTest(resonance_sign=sign):
+                fit = fit_complex_resonance(
+                    f, observed.real, observed.imag, sem, 1.2 * sem,
+                    f0_guess=21360.0, f0_bounds=(21200.0, 21500.0),
+                )
+                self.assertTrue(fit.success)
+                self.assertEqual(fit.resonance_sign, sign)
+                self.assertAlmostEqual(fit.f0_hz, f0, places=3)
+                self.assertAlmostEqual(fit.q, q, places=2)
+                predicted = model_response(f, fit.parameters, center, fit.resonance_sign)
+                np.testing.assert_allclose(predicted, observed, rtol=1e-5)
+                quality = assess_fit_quality(f, observed.real, observed.imag, fit)
+                self.assertTrue(quality.accepted, quality.reasons)
+                self.assertGreater(quality.complex_r_squared, 0.99999)
+                self.assertEqual(np.sign(fit.phase_slope_deg_per_hz), -sign)
+                expected_at_f0 = (2.8e5 + 1.1e5j) / (1j / q)
+                expected_at_f0 += 1.2e6 - 2.0e6j + (1400.0 + 900.0j) * (f0 - center)
+                expected_phase = sign * np.angle(expected_at_f0, deg=True)
+                self.assertAlmostEqual(fit.phase_deg, expected_phase, places=3)
+
     def test_constrained_fit_stays_on_selected_mode(self):
         f = np.linspace(9500, 10500, 1001)
         selected = np.array([9800.0, np.log(800.0), 0.35, 0.1, 0.0, 0.0, 0.0, 0.0])
@@ -89,6 +119,16 @@ class ResonanceModelTests(unittest.TestCase):
         self.assertEqual(len(indices), 1)
         self.assertAlmostEqual(f[indices[0]], 29400.0, delta=35.0)
 
+    def test_three_db_bounds_use_absolute_amplitude_and_require_both_sides(self):
+        f = np.linspace(-10.0, 10.0, 2001)
+        r = 2.0 + 8.0 / np.sqrt(1.0 + (f / 2.0) ** 2)
+        bounds = three_db_bounds(f, r, 1000)
+        self.assertIsNotNone(bounds)
+        expected = 2.0 * np.sqrt((8.0 / (10.0 / np.sqrt(2.0) - 2.0)) ** 2 - 1.0)
+        self.assertAlmostEqual(bounds[0], -expected, places=2)
+        self.assertAlmostEqual(bounds[1], expected, places=2)
+        self.assertIsNone(three_db_bounds(f[1000:], r[1000:], 0))
+
     def test_fit_quality_rejects_sub_bin_linewidth(self):
         f = np.arange(29380.0, 29424.0, 4.0)
         parameters = np.array([29401.0, np.log(58000.0), 1e-6, 0.0,
@@ -103,6 +143,22 @@ class ResonanceModelTests(unittest.TestCase):
         quality = assess_fit_quality(f, z.real, z.imag, fit)
         self.assertFalse(quality.accepted)
         self.assertLess(quality.linewidth_bins, 1.0)
+
+    def test_fit_quality_rejects_linewidth_larger_than_measured_span(self):
+        f = np.linspace(38350.0, 39250.0, 151)
+        parameters = np.array([39030.0, np.log(0.5), 1.0, 0.0,
+                               0.02, 0.01, 1e-5, 0.0])
+        z = model_response(f, parameters, np.mean(f))
+        fit = ResonanceFit(
+            f0_hz=39030.0, q=0.5, linewidth_hz=78060.0,
+            phase_deg=0.0, phase_slope_deg_per_hz=0.0,
+            f0_std_hz=0.1, q_std=1e-6, reduced_chi2=0.0,
+            success=True, message="synthetic", parameters=parameters,
+        )
+        quality = assess_fit_quality(f, z.real, z.imag, fit)
+        self.assertFalse(quality.accepted)
+        self.assertGreater(quality.complex_r_squared, 0.999)
+        self.assertTrue(any("측정 구간" in reason for reason in quality.reasons))
 
     def test_fit_quality_accepts_resolved_clean_resonance(self):
         f = np.linspace(9900.0, 10100.0, 401)

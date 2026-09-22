@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from particle_review_noise import analyze_noise,save_noise_analysis
+from particle_review_mit_noise import analyze_mit_noise, save_mit_noise_analysis
 
 
 class NoiseTests(unittest.TestCase):
@@ -61,6 +62,31 @@ class NoiseTests(unittest.TestCase):
             self.assertTrue((Path(path)/'snr_context_overview.png').exists())
             self.assertEqual(json.loads((Path(path)/'snr_analysis_settings.json').read_text(encoding='utf-8'))['guard_s'],.25)
 
+    def test_mit_interpeak_highpass_noise_and_export(self):
+        t=np.arange(0.,20.,.01)
+        # Deliberate low-frequency drift plus a higher-frequency noise-like term.
+        d=pd.DataFrame(dict(Time_s=t, Frequency_Hz=100+.20*np.sin(2*np.pi*.10*t)+.03*np.sin(2*np.pi*14*t)))
+        events=[dict(time_s=x,event_start_s=x,event_end_s=x,depth_hz=1.) for x in (4.,8.,12.,16.)]
+        result=analyze_mit_noise(d,events,guard_s=.25,min_duration_s=1.)
+        self.assertEqual(len(result['segments']),3)
+        self.assertEqual(result['summary']['valid_segment_count'],3)
+        self.assertTrue(np.isfinite(result['summary']['pooled_sigma_hz']))
+        self.assertTrue((result['segments'].sigma_mit_hz>0).all())
+        self.assertEqual(result['settings']['cutoff_hz'],1.)
+        self.assertEqual(result['settings']['order'],2)
+        with tempfile.TemporaryDirectory() as folder:
+            save_mit_noise_analysis(folder,result,'test.csv')
+            self.assertTrue((Path(folder)/'mit_noise_segments.csv').exists())
+            self.assertTrue((Path(folder)/'mit_noise_analysis.json').exists())
+
+    def test_mit_short_or_overlapping_baselines_are_reported(self):
+        t=np.arange(0.,4.,.01)
+        d=pd.DataFrame(dict(Time_s=t, Frequency_Hz=100+.01*np.sin(2*np.pi*15*t)))
+        events=[dict(time_s=x,event_start_s=x,event_end_s=x) for x in (1.,1.3,3.)]
+        result=analyze_mit_noise(d,events,guard_s=.25,min_duration_s=1.)
+        self.assertEqual(result['segments'].iloc[0].status,'overlap')
+        self.assertEqual(result['segments'].iloc[1].status,'ok')
+
     def test_gui_compute_settings_invalidate_and_resume(self):
         from unittest.mock import patch
         from PyQt5 import QtWidgets
@@ -74,6 +100,11 @@ class NoiseTests(unittest.TestCase):
             w.calculate_context_noise()
             self.assertEqual(w.noise_panel.table.rowCount(),1)
             self.assertEqual(w.right_tabs.currentWidget(),w.noise_panel)
+            w.events=[manual_event(w.data,2.),manual_event(w.data,4.),manual_event(w.data,6.)]
+            w.refresh_table()
+            w.calculate_mit_noise()
+            self.assertEqual(w.mit_noise_panel.table.rowCount(),2)
+            self.assertEqual(w.right_tabs.currentWidget(),w.mit_noise_panel)
             w.noise_guard.setValue(.3)
             self.assertIsNone(w.noise_panel.analysis)
             w.calculate_context_noise()

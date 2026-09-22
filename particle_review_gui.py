@@ -12,8 +12,13 @@ from particle_review_core import (Settings, ParticlePropertySettings, load_raw, 
                                   detect, local_baseline, manual_event, settings_dict,
                                   batch_context_noise, estimate_particle_properties,
                                   load_sensitivity_profiles, save_sensitivity_profile)
-from particle_review_noise import analyze_noise
+from particle_review_noise import analyze_noise, recompute_event_depths
 from particle_review_noise_gui import NoisePanel
+from particle_review_mit_noise import analyze_mit_noise
+from particle_review_mit_noise_gui import MitNoisePanel
+from particle_review_savgol_gui import SavgolPanel
+from particle_review_mit_signal import analyze_mit_signal
+from particle_review_mit_signal_gui import MitSignalPanel
 from particle_review_core import sample_window_stats
 
 
@@ -60,6 +65,8 @@ class ReviewWindow(QtWidgets.QMainWindow):
         self.saved_sensitivity_profiles={}
         self.removed_stack=[]; self.figure_worker=None
         self.noise_window=self.spin(1.0,.1,120); self.noise_guard=self.spin(.25,0,30); self.noise_degree=QtWidgets.QComboBox(); self.noise_degree.addItems(['1 (선형 drift)','2 (완만한 곡률)'])
+        self.mit_guard=self.spin(.25,0,30); self.mit_min_duration=self.spin(1.0,.1,120)
+        self.mit_prominence=self.spin(2.0,.5,20); self.mit_local_fit=self.spin(.20,.05,.5)
         pg.setConfigOptions(background='w', foreground='#263344', antialias=False)
         root=QtWidgets.QWidget(); self.setCentralWidget(root)
         layout=QtWidgets.QVBoxLayout(root)
@@ -154,15 +161,32 @@ class ReviewWindow(QtWidgets.QMainWindow):
         noise_box=QtWidgets.QGroupBox('후보 전후 주파수 노이즈 / SNR'); nf=QtWidgets.QFormLayout(noise_box); ll.addWidget(noise_box)
         nf.addRow('각 방향 구간 길이 (s)',self.noise_window); nf.addRow('후보 제외 guard (s)',self.noise_guard); nf.addRow('drift 모델',self.noise_degree)
         self.noise_btn=QtWidgets.QPushButton('남은 후보 노이즈 + SNR 계산'); self.noise_btn.clicked.connect(self.calculate_context_noise); nf.addRow(self.noise_btn)
+        mit_box=QtWidgets.QGroupBox('MIT 논문 Fig. 4 방식 노이즈 비교'); mf=QtWidgets.QFormLayout(mit_box); ll.addWidget(mit_box)
+        mf.addRow('피크 양쪽 추가 제외 guard (s)',self.mit_guard)
+        mf.addRow('최소 baseline 길이 (s)',self.mit_min_duration)
+        mf.addRow('필터',QtWidgets.QLabel('1 Hz, 2차 Butterworth high-pass (고정)'))
+        mf.addRow('Antinode prominence (σ, 현재 데이터 2 / 논문 약 5–10)',self.mit_prominence)
+        mf.addRow('국소 2차 fit 반폭 / antinode 간격 (추정)',self.mit_local_fit)
+        self.mit_noise_btn=QtWidgets.QPushButton('MIT 논문 방식 비교 계산'); self.mit_noise_btn.clicked.connect(self.calculate_mit_noise); mf.addRow(self.mit_noise_btn)
         manual=QtWidgets.QHBoxLayout(); ll.addLayout(manual)
         self.manual_time=self.spin(0); manual.addWidget(self.manual_time)
         btn=QtWidgets.QPushButton('시각으로 수동 후보 추가'); btn.clicked.connect(self.add_manual); manual.addWidget(btn)
         self.right_tabs=QtWidgets.QTabWidget(); split.addWidget(self.right_tabs)
         right=QtWidgets.QWidget(); rl=QtWidgets.QVBoxLayout(right); self.right_tabs.addTab(right,'입자 파형 검토')
         self.noise_panel=NoisePanel(self); self.right_tabs.addTab(self.noise_panel,'노이즈 / SNR')
+        self.mit_noise_panel=MitNoisePanel(self); self.right_tabs.addTab(self.mit_noise_panel,'MIT 논문 비교')
+        self.savgol_panel=SavgolPanel(self); self.right_tabs.addTab(self.savgol_panel,'Savitzky–Golay 비교')
+        self.mit_signal_panel=MitSignalPanel(self); self.right_tabs.addTab(self.mit_signal_panel,'MIT 피크 분석')
+        self.savgol_panel.noiseRequested.connect(self.calculate_sg_context_noise)
+        self.savgol_panel.mitRequested.connect(self.calculate_mit_signal)
+        self.savgol_panel.propertiesRequested.connect(self.calculate_sg_particle_properties)
         self.noise_window.valueChanged.connect(self.noise_panel.invalidate)
         self.noise_guard.valueChanged.connect(self.noise_panel.invalidate)
         self.noise_degree.currentIndexChanged.connect(self.noise_panel.invalidate)
+        self.mit_guard.valueChanged.connect(self.mit_noise_panel.invalidate)
+        self.mit_min_duration.valueChanged.connect(self.mit_noise_panel.invalidate)
+        self.mit_prominence.valueChanged.connect(self.mit_signal_panel.invalidate)
+        self.mit_local_fit.valueChanged.connect(self.mit_signal_panel.invalidate)
         self.overview=pg.PlotWidget(); self.overview.setLabel('left','Frequency',units='Hz'); self.overview.setLabel('bottom','Time',units='s')
         self.overview.getAxis('left').enableAutoSIPrefix(False)
         self.overview.setMaximumHeight(220); rl.addWidget(self.overview)
@@ -276,6 +300,8 @@ class ReviewWindow(QtWidgets.QMainWindow):
 
     def refresh_table(self):
         self.noise_panel.invalidate()
+        self.mit_noise_panel.invalidate()
+        self.mit_signal_panel.invalidate()
         self._editing=True; self.table.setRowCount(len(self.events))
         for row,e in enumerate(self.events):
             values=[e['time_s'],e['depth_hz'],e['width_s'],e['contrast_hz'],e['pressure_delay_s'],e['family'],e['status'],e['note'],
@@ -293,6 +319,7 @@ class ReviewWindow(QtWidgets.QMainWindow):
         if self.data is not None:
             t=self.data.Time_s.to_numpy(); f=self.data.Frequency_Hz.to_numpy()
             self.markers.setData([dict(pos=(e['time_s'],float(np.interp(e['time_s'],t,f))),data=i) for i,e in enumerate(self.events)])
+        self.savgol_panel.set_source(self.data,self.events,self.table.currentRow())
 
     def edit_event(self,item):
         if not self._editing and item.column() in (6,7):
@@ -304,6 +331,7 @@ class ReviewWindow(QtWidgets.QMainWindow):
         row=self.table.currentRow()
         if not 0<=row<len(self.events):return
         event=self.events[row]; center=event['time_s']; self.manual_time.setValue(center)
+        self.savgol_panel.set_selected_event(row)
         lo=event.get('event_start_s',center-.1); hi=event.get('event_end_s',center+.1)
         if not np.isfinite([lo,hi]).all() or hi<=lo:lo,hi=center-.1,center+.1
         self.sample_region.setRegion([lo,hi])
@@ -561,7 +589,7 @@ class ReviewWindow(QtWidgets.QMainWindow):
             reference_density_kg_m3=self.reference_density.value(),sensitivity_pg_hz=self.mass_sensitivity.value(),
             representative_method=self.representative_method.currentData(),inference_method=self.inference_method.currentData())
 
-    def calculate_particle_properties(self, automatic=False):
+    def calculate_particle_properties(self, automatic=False, signal_label=None):
         if not self.events:self.error('질량·밀도를 계산할 후보가 없습니다.');return
         settings=self.get_property_settings()
         try:self.events,self.property_calibration=estimate_particle_properties(self.events,settings)
@@ -580,7 +608,8 @@ class ReviewWindow(QtWidgets.QMainWindow):
         cal=self.property_calibration; individual=cal['individual_stats']; pairs=cal['pair_stats']
         saved_text=' · 감도 영구 저장 완료' if saved else ''
         automatic_text='자동 적용 · ' if automatic else ''
-        result=(f"{automatic_text}왕복쌍 {cal['complete_pair_count']}개 · 대표 신호 {cal['representative_depth_hz']:.4f} Hz · "
+        source=signal_label or (self.events[0].get('depth_signal_source','raw') if self.events else 'raw')
+        result=(f"{automatic_text}입력 {source} · 왕복쌍 {cal['complete_pair_count']}개 · 대표 신호 {cal['representative_depth_hz']:.4f} Hz · "
                 f"대표 부유질량 {cal['representative_buoyant_mass_pg']:.4g} pg · "
                 f"쌍 표준편차 {pairs['std_hz']:.4f} Hz / 표준오차 {pairs['sem_hz']:.4f} Hz / CV {pairs['cv_percent']:.2f}% · "
                 f"개별 CV {individual['cv_percent']:.2f}% · 방향 평균 {cal['direction_mean_forward_hz']:.4f}/{cal['direction_mean_reverse_hz']:.4f} Hz "
@@ -597,6 +626,19 @@ class ReviewWindow(QtWidgets.QMainWindow):
         self.update_property_summary('자동 역산 완료' if automatic else ('보정·역산 완료' if saved else '역산 완료'))
         self.statusBar().showMessage('왕복쌍 대표 신호와 대표 부유질량 계산을 완료했습니다.')
 
+    def calculate_sg_particle_properties(self):
+        if self.data is None or not self.events:self.error('SG 물성 계산을 수행할 후보가 없습니다.');return
+        try:
+            filtered=self.savgol_panel.filtered_data();sg=self.savgol_panel.get_settings()
+            label=f"SG(p={sg['order']}, w={sg['window_length']})"
+            self.events=recompute_event_depths(filtered,self.events,label)
+            failed=[event for event in self.events if not np.isfinite(event.get('depth_hz',np.nan))]
+            if failed:raise ValueError(f'SG Δf를 다시 계산하지 못한 후보가 {len(failed)}개 있습니다. 이벤트 구간과 양쪽 baseline을 확인하세요.')
+            self.invalidate_particle_properties()
+            self.calculate_particle_properties(signal_label=label)
+            self.statusBar().showMessage('SG 신호에서 Δf를 다시 계산해 왕복쌍 대표값과 물성을 갱신했습니다. raw_depth_hz는 보존했습니다.')
+        except Exception as exc:self.error(str(exc))
+
     def export_results(self):
         if self.data is None:return
         path,_=QtWidgets.QFileDialog.getSaveFileName(self,'검토 결과 저장',str(self.path.with_name(self.path.stem+'_review.csv')),'CSV (*.csv)')
@@ -608,6 +650,9 @@ class ReviewWindow(QtWidgets.QMainWindow):
             pd.DataFrame(self.events).to_csv(target,index=False,encoding='utf-8-sig')
             info=dict(source=str(self.path),settings=settings_dict(self.last_settings) if self.last_settings else None,metadata=self.metadata,thresholds=self.thresholds,pressure_changes=self.changes.to_dict('records'),sample_count=len(self.data),time_start=float(self.data.Time_s.iloc[0]),time_end=float(self.data.Time_s.iloc[-1]),note='탐색 후보이며 입자 확정/검출한계가 아닙니다.')
             info['noise_settings']=self.get_noise_settings()
+            info['mit_noise_settings']=self.get_mit_noise_settings()
+            info['savgol_settings']=self.savgol_panel.get_settings()
+            info['mit_signal_settings']=self.get_mit_signal_settings()
             info['particle_property_settings']=settings_dict(self.get_property_settings())
             info['particle_property_calibration']=self.property_calibration
             if self.property_calibration:
@@ -621,14 +666,65 @@ class ReviewWindow(QtWidgets.QMainWindow):
     def calculate_context_noise(self):
         if self.data is None or not self.events:self.error('전후 noise를 계산할 후보가 없습니다.');return
         try:
-            result=analyze_noise(self.data,self.events,**self.get_noise_settings())
+            result=analyze_noise(self.data,self.events,**self.get_noise_settings(),signal_source='raw')
             self.noise_panel.set_result(result,self.data,self.path,deepcopy(self.metadata))
             self.right_tabs.setCurrentWidget(self.noise_panel)
             self.statusBar().showMessage('노이즈 / SNR 계산 완료. 표의 행을 선택해 제외 구간을 확인하고 결과를 저장하세요.')
         except Exception as exc:self.error(str(exc))
 
+    def calculate_sg_context_noise(self):
+        if self.data is None or not self.events:self.error('SG 노이즈/SNR을 계산할 후보가 없습니다.');return
+        try:
+            filtered=self.savgol_panel.filtered_data(); sg=self.savgol_panel.get_settings()
+            fs=1/float(np.median(np.diff(filtered.Time_s.to_numpy())))
+            label=f"SG(p={sg['order']}, w={sg['window_length']}, {sg['window_length']/fs * 1000:.3f} ms)"
+            result=analyze_noise(filtered,self.events,**self.get_noise_settings(),signal_source=label,recompute_depth=True)
+            metadata=deepcopy(self.metadata);metadata['Analysis_signal']=label
+            self.noise_panel.set_result(result,filtered,self.path,metadata)
+            self.right_tabs.setCurrentWidget(self.noise_panel)
+            self.statusBar().showMessage('SG 신호에서 Δf와 전후 노이즈를 다시 계산해 SNR을 갱신했습니다.')
+        except Exception as exc:self.error(str(exc))
+
+    def calculate_mit_noise(self):
+        if self.data is None or len(self.events)<2:
+            self.error('MIT 비교에는 피크 사이 baseline을 만들기 위해 후보가 최소 2개 필요합니다.')
+            return
+        try:
+            result=analyze_mit_noise(
+                self.data, self.events, guard_s=self.mit_guard.value(),
+                min_duration_s=self.mit_min_duration.value())
+            self.mit_noise_panel.set_result(result,self.data,self.path,deepcopy(self.metadata))
+            self.right_tabs.setCurrentWidget(self.mit_noise_panel)
+            self.statusBar().showMessage('MIT 논문 방식 비교 계산 완료. 유효 구간과 필터 edge 경고를 확인하세요.')
+        except Exception as exc:
+            self.error(str(exc))
+
+    def calculate_mit_signal(self):
+        if self.data is None or not self.events:
+            self.error('MIT 피크 분석에는 검토 후보가 필요합니다.');return
+        try:
+            settings=self.get_mit_signal_settings()
+            result=analyze_mit_signal(self.data,self.events,**settings,
+                noise_guard_s=self.mit_guard.value(),noise_min_duration_s=self.mit_min_duration.value())
+            self.mit_signal_panel.set_result(result,self.path,deepcopy(self.metadata))
+            self.right_tabs.setCurrentWidget(self.mit_signal_panel)
+            valid=int((result['summary'].status=='ok').sum())
+            self.statusBar().showMessage(f'MIT 방식 피크 분석 완료: 유효 {valid}/{len(result["summary"])}개. 추정 파라미터와 antinode를 확인하세요.')
+        except Exception as exc:self.error(str(exc))
+
     def get_noise_settings(self):
         return dict(window_s=self.noise_window.value(),guard_s=self.noise_guard.value(),degree=self.noise_degree.currentIndex()+1)
+
+    def get_mit_noise_settings(self):
+        return dict(guard_s=self.mit_guard.value(), min_duration_s=self.mit_min_duration.value(),
+                    cutoff_hz=1.0, order=2)
+
+    def get_mit_signal_settings(self):
+        sg=self.savgol_panel.get_settings()
+        return dict(sg_order=sg['order'],sg_window=sg['window_length'],
+                    prominence_sigma=self.mit_prominence.value(),baseline_multiplier=3.0,
+                    local_fit_fraction=self.mit_local_fit.value(),antinode_count=7,
+                    outer_tolerance_percent=20.0)
 
     def show_noise_summary(self,result):
         rows=[]
@@ -668,6 +764,13 @@ class ReviewWindow(QtWidgets.QMainWindow):
             ns=info.get('noise_settings')
             if ns:
                 self.noise_window.setValue(ns.get('window_s',1.0)); self.noise_guard.setValue(ns.get('guard_s',.25)); self.noise_degree.setCurrentIndex(ns.get('degree',1)-1)
+            ms=info.get('mit_noise_settings')
+            if ms:
+                self.mit_guard.setValue(ms.get('guard_s',.25)); self.mit_min_duration.setValue(ms.get('min_duration_s',1.0))
+            self.savgol_panel.set_settings(info.get('savgol_settings'))
+            mss=info.get('mit_signal_settings')
+            if mss:
+                self.mit_prominence.setValue(mss.get('prominence_sigma',2.0));self.mit_local_fit.setValue(mss.get('local_fit_fraction',.20))
             ps=info.get('particle_property_settings')
             if ps:
                 self.mode_number.setValue(ps.get('mode_number',6)); self.diameter_min.setValue(ps.get('diameter_min_um',190)); self.diameter_max.setValue(ps.get('diameter_max_um',220))
@@ -694,7 +797,7 @@ class ReviewWindow(QtWidgets.QMainWindow):
         if self.worker is not None and self.worker.isRunning():self.error('자동 분석이 끝난 뒤 저장하세요.');return
         parent=QtWidgets.QFileDialog.getExistingDirectory(self,f'남은 {len(self.events)}행의 그래프 저장 위치 (확대 폭 {self.span.value():g}초)',str(self.path.parent))
         if not parent:return
-        self.figure_worker=FigureExportWorker(self.data,self.events,parent,self.path,self.span.value(),self.residual.isChecked(),settings_dict(self.last_settings) if self.last_settings else None,dict(metadata=self.metadata,thresholds=self.thresholds,noise_settings=self.get_noise_settings(),particle_property_settings=settings_dict(self.get_property_settings()),particle_property_calibration=self.property_calibration))
+        self.figure_worker=FigureExportWorker(self.data,self.events,parent,self.path,self.span.value(),self.residual.isChecked(),settings_dict(self.last_settings) if self.last_settings else None,dict(metadata=self.metadata,thresholds=self.thresholds,noise_settings=self.get_noise_settings(),mit_noise_settings=self.get_mit_noise_settings(),particle_property_settings=settings_dict(self.get_property_settings()),particle_property_calibration=self.property_calibration))
         self.export_progress=QtWidgets.QProgressDialog('후보별 주파수·위상·진폭·압력 그래프 저장 중…','중단',0,len(self.events),self)
         self.export_progress.setWindowTitle('남은 후보 그래프 일괄 저장')
         self.export_progress.setWindowModality(QtCore.Qt.ApplicationModal)
