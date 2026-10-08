@@ -23,8 +23,9 @@ class SavgolPanel(QtWidgets.QWidget):
         self.event = QtWidgets.QComboBox(); controls.addWidget(self.event, 1)
         controls.addWidget(QtWidgets.QLabel('Polynomial order'))
         self.order = QtWidgets.QSpinBox(); self.order.setRange(1, 8); self.order.setValue(4); controls.addWidget(self.order)
-        controls.addWidget(QtWidgets.QLabel('Window (표본, 홀수)'))
-        self.window = QtWidgets.QSpinBox(); self.window.setRange(3, 501); self.window.setSingleStep(2); self.window.setValue(27); controls.addWidget(self.window)
+        controls.addWidget(QtWidgets.QLabel('Window (ms)'))
+        self.window = QtWidgets.QDoubleSpinBox(); self.window.setDecimals(3); self.window.setRange(.001, 60000); self.window.setSingleStep(1); self.window.setValue(9); controls.addWidget(self.window)
+        self.window.setToolTip('입력한 ms를 샘플링 속도에 맞춰 가장 가까운 홀수 표본 수로 변환합니다.')
         controls.addWidget(QtWidgets.QLabel('표시 폭 (s)'))
         self.span = QtWidgets.QDoubleSpinBox(); self.span.setRange(.05, 120); self.span.setDecimals(3); self.span.setValue(.45); controls.addWidget(self.span)
 
@@ -62,13 +63,25 @@ class SavgolPanel(QtWidgets.QWidget):
         self.span.valueChanged.connect(self.redraw)
 
     def _window_changed(self, value):
-        if self._updating:
-            return
-        if value % 2 == 0:
-            self._updating = True
-            self.window.setValue(min(self.window.maximum(), value + 1))
-            self._updating = False
         self.redraw()
+
+    def _sampling_rate(self):
+        if self.data is None or len(self.data)<2:
+            raise ValueError('샘플링 속도 계산에 원시 데이터가 필요합니다.')
+        dt=np.diff(self.data.Time_s.to_numpy(dtype=float))
+        if not np.all(np.isfinite(dt)) or np.any(dt<=0):
+            raise ValueError('Time_s는 유한하고 증가해야 합니다.')
+        median=float(np.median(dt))
+        if np.max(np.abs(dt-median))>.05*median:
+            raise ValueError('표본 간격 변동이 5%를 넘어 SG 필터를 적용할 수 없습니다.')
+        return 1/median
+
+    def _window_samples(self, fs):
+        # Nearest odd sample count; exact ties round upward.
+        samples=2*int(np.floor(float(self.window.value())*fs/1000/2+1e-9))+1
+        minimum=int(self.order.value())+1
+        if minimum%2==0:minimum+=1
+        return max(3,minimum,samples)
 
     def set_source(self, data, events, selected_index=None):
         self.data = data
@@ -81,9 +94,6 @@ class SavgolPanel(QtWidgets.QWidget):
             target = selected_index if selected_index is not None and 0 <= selected_index < len(self.events) else old
             self.event.setCurrentIndex(target if 0 <= target < len(self.events) else 0)
         self.event.blockSignals(False)
-        if data is not None and len(data):
-            maximum = min(5001, len(data) if len(data) % 2 else len(data) - 1)
-            self.window.setMaximum(max(3, maximum))
         self.redraw()
 
     def set_selected_event(self, index):
@@ -91,7 +101,12 @@ class SavgolPanel(QtWidgets.QWidget):
             self.event.setCurrentIndex(index)
 
     def get_settings(self):
-        return dict(order=int(self.order.value()), window_length=int(self.window.value()), span_s=float(self.span.value()))
+        fs=self._sampling_rate(); samples=self._window_samples(fs)
+        if samples>len(self.data):
+            raise ValueError('Window 시간이 데이터 길이보다 큽니다.')
+        return dict(order=int(self.order.value()), window_ms=float(self.window.value()),
+                    window_length=samples, applied_window_ms=1000*samples/fs,
+                    sampling_rate_hz=fs, span_s=float(self.span.value()))
 
     def filtered_data(self):
         """Return a data-frame copy whose frequency column is the current SG result."""
@@ -106,10 +121,13 @@ class SavgolPanel(QtWidgets.QWidget):
         if not settings:
             return
         self.order.setValue(int(settings.get('order', 4)))
-        window = int(settings.get('window_length', 27))
-        if window % 2 == 0:
-            window += 1
-        self.window.setValue(max(3, window))
+        if 'window_ms' in settings:
+            window_ms=float(settings['window_ms'])
+        else:
+            # Migrate older saved reviews that stored a sample count.
+            fs=self._sampling_rate()
+            window_ms=1000*int(settings.get('window_length',27))/fs
+        self.window.setValue(window_ms)
         self.span.setValue(float(settings.get('span_s', .45)))
         self.redraw()
 
@@ -132,17 +150,16 @@ class SavgolPanel(QtWidgets.QWidget):
         if self.data is None or not len(self.data):
             self.info.setText('원시 CSV를 열면 Savitzky-Golay 비교가 표시됩니다.')
             return
-        order = int(self.order.value()); window = int(self.window.value())
-        if window % 2 == 0 or order >= window or window > len(self.data):
-            self.info.setText('Window는 데이터 길이 이하의 홀수이고 polynomial order보다 커야 합니다.')
+        order = int(self.order.value())
+        try:
+            fs=self._sampling_rate(); window=self._window_samples(fs)
+        except ValueError as exc:
+            self.info.setText(str(exc)); return
+        if window > len(self.data):
+            self.info.setText('Window 시간이 데이터 길이보다 큽니다. 더 작은 ms 값을 입력하세요.')
             return
         t = self.data.Time_s.to_numpy(dtype=float)
         y = self.data.Frequency_Hz.to_numpy(dtype=float)
-        dt = np.diff(t); valid_dt = dt[np.isfinite(dt) & (dt > 0)]
-        if not len(valid_dt):
-            self.info.setText('증가하는 Time_s 표본이 필요합니다.')
-            return
-        fs = 1.0 / float(np.median(valid_dt))
         try:
             self.filtered = savgol_filter(y, window_length=window, polyorder=order, mode='interp')
         except ValueError as exc:
@@ -173,6 +190,6 @@ class SavgolPanel(QtWidgets.QWidget):
         shown_residual = residual[mask]
         raw_pp = float(np.ptp(y[mask])); smooth_pp = float(np.ptp(self.filtered[mask]))
         self.info.setText(
-            f'Fs {fs:,.2f} Hz · order {order} · window {window}표본 = {1000 * window / fs:.3f} ms · 표시 {np.count_nonzero(mask):,}표본\n'
+            f'Fs {fs:,.2f} Hz · order {order} · 요청 {self.window.value():.3f} ms → 적용 {1000 * window / fs:.3f} ms ({window}표본) · 표시 {np.count_nonzero(mask):,}표본\n'
             f'현재 화면 raw−SG SD {np.std(shown_residual, ddof=1):.5f} Hz · peak-to-peak raw/SG {raw_pp:.5f}/{smooth_pp:.5f} Hz'
         )

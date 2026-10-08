@@ -46,14 +46,15 @@ def _empty_segment(index, start, end, status, warning):
 
 
 def analyze_mit_noise(data, events, guard_s=0.25, cutoff_hz=1.0, order=2,
-                      min_duration_s=1.0, reference_hz=PAPER_VISUAL_REFERENCE_HZ):
+                      min_duration_s=1.0, reference_hz=PAPER_VISUAL_REFERENCE_HZ,
+                      include_edges=False, edge_duration_s=5.0):
     """Calculate Fig.-4-style baseline noise from consecutive event gaps.
 
     A segment is the interval from the end of one event's exclusion region to
     the start of the next.  Segments are filtered independently, so an event
     cannot bleed through a filter state into its neighbour.
     """
-    if len(events) < 2:
+    if len(events) < 2 and not (include_edges and len(events)==1):
         raise ValueError('MIT 비교에는 피크 사이 baseline을 만들기 위해 후보가 최소 2개 필요합니다.')
     if guard_s < 0 or cutoff_hz <= 0 or order != 2 or min_duration_s <= 0:
         raise ValueError('guard는 0 이상, cutoff/최소 길이는 양수, MIT filter order는 2여야 합니다.')
@@ -70,8 +71,12 @@ def analyze_mit_noise(data, events, guard_s=0.25, cutoff_hz=1.0, order=2,
     ordered = sorted(events, key=lambda e: float(e['time_s']))
     bounds = [_event_bounds(event, float(guard_s)) for event in ordered]
     rows, residual_rows = [], []
-    for segment_index, ((_, left_end), (right_start, _)) in enumerate(zip(bounds, bounds[1:]), 1):
-        start, end = left_end, right_start
+    intervals=[(left_end,right_start) for (_,left_end),(right_start,_) in zip(bounds,bounds[1:])]
+    if include_edges:
+        if edge_duration_s<=0:raise ValueError('전후 baseline 길이는 양수여야 합니다.')
+        intervals=[(max(t_all[0],bounds[0][0]-edge_duration_s),bounds[0][0]),
+                   *intervals,(bounds[-1][1],min(t_all[-1],bounds[-1][1]+edge_duration_s))]
+    for segment_index, (start,end) in enumerate(intervals, 1):
         if end <= start:
             rows.append(_empty_segment(segment_index, start, end, 'overlap', '인접 후보의 제외 구간이 겹칩니다.'))
             continue
@@ -127,7 +132,8 @@ def analyze_mit_noise(data, events, guard_s=0.25, cutoff_hz=1.0, order=2,
         settings=dict(guard_s=float(guard_s), cutoff_hz=float(cutoff_hz), order=int(order),
                       min_duration_s=float(min_duration_s), std_ddof=1,
                       filtering='per-segment scipy.signal.sosfiltfilt (zero phase); no polynomial detrending',
-                      method='inter-peak baseline; high-pass; subtract segment mean; time-domain SD',
+                      method=('local before/after baseline (single-event extension)' if include_edges else 'inter-peak baseline')+'; high-pass; subtract segment mean; time-domain SD',
+                      include_edges=bool(include_edges),edge_duration_s=float(edge_duration_s),
                       paper_reference_hz=float(reference_hz),
                      paper_reference_note='Supplementary Fig. S5 all-data mean; not an acceptance threshold'),
     )

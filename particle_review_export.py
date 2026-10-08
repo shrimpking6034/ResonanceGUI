@@ -8,12 +8,56 @@ import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.font_manager import FontProperties
+from matplotlib import rc_context
 from particle_review_core import local_baseline, pressure_changes, batch_context_noise
 from particle_review_core import sample_window_stats
 
 
+def save_publication_panels(axes, folder, stem):
+    """Export each measured quantity at identical physical size in all formats."""
+    files=[]
+    style={'font.family':'Arial','font.size':10,'axes.labelsize':10,
+           'xtick.labelsize':10,'ytick.labelsize':10,'legend.fontsize':10,
+           'axes.linewidth':.8,'pdf.fonttype':42,'ps.fonttype':42,'svg.fonttype':'none'}
+    with rc_context(style):
+        for source, quantity in zip(axes, ('frequency','phase','amplitude','pressure')):
+            fig=Figure(figsize=(90/25.4,90/25.4),layout='constrained')
+            FigureCanvasAgg(fig); ax=fig.add_subplot(111)
+            for line in source.lines:
+                if line.get_transform() == source.get_xaxis_transform():
+                    ax.axvline(line.get_xdata()[0],color=line.get_color(),
+                               linestyle=line.get_linestyle(),linewidth=.7)
+                    continue
+                ax.plot(line.get_xdata(),line.get_ydata(),color=line.get_color(),
+                        linestyle=line.get_linestyle(),linewidth=1.2,
+                        drawstyle=line.get_drawstyle(),label=line.get_label())
+            for patch in source.patches:
+                # Event intervals use data x coordinates and axes y coordinates.
+                if hasattr(patch,'get_x'):
+                    ax.axvspan(patch.get_x(),patch.get_x()+patch.get_width(),
+                               color=patch.get_facecolor())
+                elif hasattr(patch,'get_xy'):
+                    xy=np.asarray(patch.get_xy())
+                    ax.axvspan(xy[:,0].min(),xy[:,0].max(),color=patch.get_facecolor())
+            if source.texts:
+                ax.text(.5,.5,'Not recorded',transform=ax.transAxes,ha='center')
+            ax.set(xlabel='Time (s)',ylabel=source.get_ylabel(),xlim=source.get_xlim())
+            ax.set_box_aspect(1)
+            ax.spines[['top','right']].set_visible(False)
+            ax.tick_params(direction='out',width=.8)
+            ax.ticklabel_format(axis='both',style='plain',useOffset=False)
+            if source.get_legend() is not None:ax.legend(frameon=False,loc='best')
+            for extension in ('png','pdf','svg'):
+                filename=f'{stem}_{quantity}.{extension}'
+                fig.savefig(folder/filename,dpi=600,facecolor='white')
+                files.append(filename)
+            fig.clear()
+    return files
+
+
 def export_event_figures(data, events, parent, source, span, residual=False,
-                         settings=None, progress=None, cancelled=None, review_context=None):
+                         settings=None, progress=None, cancelled=None, review_context=None,
+                         plot_bounds=None):
     folder=Path(parent)/('particle_graphs_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
     folder.mkdir(parents=True,exist_ok=False)
     t=data.Time_s.to_numpy(); f=data.Frequency_Hz.to_numpy()
@@ -32,6 +76,7 @@ def export_event_figures(data, events, parent, source, span, residual=False,
         for index,event in enumerate(events,1):
             if cancelled and cancelled():break
             center=float(event['time_s']); lo=max(t[0],center-span/2); hi=min(t[-1],center+span/2)
+            if plot_bounds is not None:lo=max(t[0],float(plot_bounds[0])); hi=min(t[-1],float(plot_bounds[1]))
             mask=(t>=lo)&(t<=hi)
             if sum(mask)<2:raise ValueError(f'{center:.4f}초 주변에 그래프 표본이 부족합니다.')
             values=f; applied=False
@@ -72,8 +117,12 @@ def export_event_figures(data, events, parent, source, span, residual=False,
             if note:heading+='\n'+'\n'.join(textwrap.wrap('메모: '+note,width=90))
             fig.suptitle(heading,fontproperties=font,fontsize=10)
             filename=f'{index:03d}_{center:012.4f}s.png'
-            fig.savefig(folder/filename,dpi=160); fig.clear()
+            fig.savefig(folder/filename,dpi=160)
+            panel_folder=folder/'publication'; panel_folder.mkdir(exist_ok=True)
+            panel_files=save_publication_panels(axes,panel_folder,Path(filename).stem)
+            fig.clear()
             completed.append({**event,'graph_file':filename,'plot_start_s':lo,'plot_end_s':hi,'residual_applied':applied,
+                              'publication_files':json.dumps(['publication/'+name for name in panel_files]),
                               'plot_sample_count':sample_stats['sample_count'],'plot_sampling_rate_hz':sample_stats['sampling_rate_hz']})
             if progress:progress(index,len(events))
     except Exception as exc:
@@ -94,6 +143,7 @@ def export_event_figures(data, events, parent, source, span, residual=False,
                       metadata={},pressure_changes=pressure_changes(data).to_dict('records'),
                       span_s=span,residual_requested=residual,context_noise_window_s=max(.1,min(1.0,span/2)),context_noise_guard_s=min(.1,span/10),requested_count=len(events),
                       completed_count=len(completed),cancelled=bool(cancelled and cancelled()),error=error)
+        metadata['publication_style']=dict(size_mm=90,font='Arial',font_size_pt=10,line_width_pt=1.2,dpi=600,formats=['png','pdf','svg'])
         if review_context:
             metadata['metadata']=review_context.get('metadata',{})
             metadata['thresholds']=review_context.get('thresholds',[])

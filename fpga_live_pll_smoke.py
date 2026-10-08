@@ -1,4 +1,4 @@
-"""Bounded first-order PLL stream test with low drive and automatic stop."""
+"""Bounded type-2 PI PLL test with a first-order target loop response."""
 from __future__ import annotations
 
 import argparse

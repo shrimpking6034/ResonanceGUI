@@ -19,6 +19,20 @@ PLL_SAMPLE_PERIOD_S = 1e-8
 Q30 = 2**30
 
 
+def pll_update_rate_hz(cic_rate: int) -> float:
+    """Return the PLL/CIC update rate implied by the saved VI formula.
+
+    The LabVIEW coefficient code uses ``Ts * CIC_rate`` as the decimated
+    sample period, with Ts=10 ns.  This is also consistent with the working
+    32767 setting producing about 3052 samples/s.  It does not include the
+    separate optional UDP ``PLL_datarate_decimation`` mode field.
+    """
+    rate = int(cic_rate)
+    if not 16 <= rate <= 32767:
+        raise RegisterValueError("cic_rate must be 16..32767")
+    return 1.0 / (PLL_SAMPLE_PERIOD_S * rate)
+
+
 class RegisterValueError(ValueError):
     pass
 

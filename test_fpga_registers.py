@@ -4,7 +4,8 @@ import unittest
 from fpga_registers import (
     DEFAULT_REGISTER_ADDRESSES, NCO_CLOCK_HZ, ModeFields, PLLUserParameters,
     RegisterValueError, frequency_to_word, register_write_map,
-    signed_to_wire, user_parameters_to_registers, word_to_frequency,
+    pll_update_rate_hz, signed_to_wire, user_parameters_to_registers,
+    word_to_frequency,
 )
 
 
@@ -24,6 +25,12 @@ class FPGARegisterTests(unittest.TestCase):
         value = 29400.12345
         result = word_to_frequency(frequency_to_word(value))
         self.assertLessEqual(abs(result-value), 0.5*NCO_CLOCK_HZ/2**32)
+
+    def test_pll_update_rate_follows_100mhz_cic_decimation(self):
+        self.assertAlmostEqual(pll_update_rate_hz(32767), 100e6 / 32767)
+        self.assertAlmostEqual(pll_update_rate_hz(16384), 100e6 / 16384)
+        with self.assertRaises(RegisterValueError):
+            pll_update_rate_hz(15)
 
     def test_nco_clock_itself_is_rejected_instead_of_wrapping_to_zero(self):
         with self.assertRaises(RegisterValueError):

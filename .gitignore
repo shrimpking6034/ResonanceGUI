@@ -23,9 +23,13 @@ dist/
 .chart-data-*/
 tmp/
 outputs/
+diagnostics/
 
 # 실험 및 측정 데이터
 Noise Data/
+기본연구/
+챔버/
+Particle_data/
 raw_*.csv
 events_*.csv
 integration_*.json

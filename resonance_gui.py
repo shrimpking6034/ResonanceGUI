@@ -935,6 +935,7 @@ class MainWindow(QMainWindow):
             "pll_d_spin", "pll_pm_spin", "pll_derivative_check", "pll_integral_check",
             "pll_invert_sign_check",
             "live_savgol_enabled", "live_savgol_window_spin", "live_savgol_order_spin",
+            "live_residual_enabled",
         )
         return {name: getattr(self, name) for name in names}
 
@@ -1253,6 +1254,26 @@ class MainWindow(QMainWindow):
             pen=pg.mkPen('#9a4c00', width=1.5), name='Detected candidate')
         self.live_particle_plot.addItem(self.live_particle_markers)
         layout.addWidget(self.live_particle_plot, 1)
+
+        self.live_residual_enabled = QCheckBox("Raw − SG filtered 잔차 표시 (Hz)")
+        self.live_residual_enabled.setToolTip(
+            "현재 SG 창·차수로 계산한 원신호 − 평활 신호를 표시합니다. "
+            "표시 전용이며 검출과 원본 CSV에는 영향을 주지 않습니다. "
+            "양 끝의 반 창 구간은 제외하므로 최신 잔차는 반 창만큼 늦게 표시됩니다.")
+        layout.addWidget(self.live_residual_enabled)
+        self.live_residual_plot = pg.PlotWidget(background='w')
+        self.live_residual_plot.setLabel('bottom', 'Time (s)')
+        self.live_residual_plot.setLabel('left', 'Raw − SG (Hz)')
+        self.live_residual_plot.showGrid(x=True, y=True, alpha=.25)
+        self.live_residual_plot.setMinimumHeight(180)
+        self.live_residual_plot.setXLink(self.live_particle_plot)
+        self.live_residual_curve = self.live_residual_plot.plot(
+            pen=pg.mkPen('#147d80', width=1), name='Raw − SG')
+        self.live_residual_plot.addItem(pg.InfiniteLine(
+            pos=0, angle=0, pen=pg.mkPen('#8899aa', style=Qt.DashLine)))
+        self.live_residual_plot.hide()
+        layout.addWidget(self.live_residual_plot, 1)
+        self.live_residual_enabled.toggled.connect(self._set_live_residual_visible)
 
         self.live_event_list = QListWidget()
         self.live_event_list.setMaximumHeight(135)
@@ -2052,12 +2073,13 @@ class MainWindow(QMainWindow):
         layout.addLayout(sg_controls, 4, 1)
         self.live_savgol_window_spin.setEnabled(False)
         self.live_savgol_order_spin.setEnabled(False)
-        self.live_savgol_enabled.toggled.connect(self.live_savgol_window_spin.setEnabled)
-        self.live_savgol_enabled.toggled.connect(self.live_savgol_order_spin.setEnabled)
+        self.live_savgol_enabled.toggled.connect(self._update_live_sg_controls)
         self.live_savgol_enabled.toggled.connect(self._set_live_filtered_trace_visible)
         self.live_savgol_enabled.toggled.connect(self.reset_live_particle_detector)
         self.live_savgol_window_spin.valueChanged.connect(self._normalize_live_savgol_window)
         self.live_savgol_order_spin.valueChanged.connect(self.reset_live_particle_detector)
+        self.live_savgol_window_spin.valueChanged.connect(self._invalidate_live_sg_preview)
+        self.live_savgol_order_spin.valueChanged.connect(self._invalidate_live_sg_preview)
 
         self.live_reset_btn = QPushButton("검출 초기화 · blank 재학습")
         self.live_reset_btn.clicked.connect(self.reset_live_particle_detector)
@@ -2084,6 +2106,22 @@ class MainWindow(QMainWindow):
         self.live_filtered_frequency_curve.setVisible(bool(enabled))
         if not enabled:
             self.live_filtered_frequency_curve.setData([], [])
+
+    def _update_live_sg_controls(self, *_):
+        enabled = self.live_savgol_enabled.isChecked() or self.live_residual_enabled.isChecked()
+        self.live_savgol_window_spin.setEnabled(enabled)
+        self.live_savgol_order_spin.setEnabled(enabled)
+
+    def _invalidate_live_sg_preview(self, *_):
+        self._last_filtered_ui_update_t = -np.inf
+        self.live_filtered_frequency_curve.setData([], [])
+        self.live_residual_curve.setData([], [])
+
+    def _set_live_residual_visible(self, enabled):
+        self.live_residual_plot.setVisible(enabled)
+        self.live_residual_plot.enableAutoRange(axis='y', enable=True)
+        self._update_live_sg_controls()
+        self._invalidate_live_sg_preview()
 
     def _build_daq_group(self):
         g = QGroupBox("8. 에어레귤레이터 (NI-DAQ)")
@@ -3268,6 +3306,7 @@ class MainWindow(QMainWindow):
         self.live_event_list.addItem("검출된 후보가 여기에 실시간으로 표시됩니다.")
         self.live_particle_markers.setData([], [])
         self.live_filtered_frequency_curve.setData([], [])
+        self.live_residual_curve.setData([], [])
         self.live_count_value.setText("0")
         self.live_latest_value.setText("—")
         self.live_export_btn.setEnabled(False)
@@ -3709,7 +3748,7 @@ class MainWindow(QMainWindow):
         self.plotter_freq_curve.setData(self.plot_t[::display_stride], self.plot_f[::display_stride])
         self.plotter_r_curve.setData(self.plot_t[::display_stride], self.plot_R[::display_stride])
         self.live_frequency_curve.setData(self.plot_t[::display_stride], self.plot_f[::display_stride])
-        if (self.live_savgol_enabled.isChecked() and
+        if ((self.live_savgol_enabled.isChecked() or self.live_residual_enabled.isChecked()) and
                 t - self._last_filtered_ui_update_t >= 0.20):
             self._last_filtered_ui_update_t = t
             # Use the detector stream (up to 4 kSa/s), rather than the more
@@ -3722,15 +3761,26 @@ class MainWindow(QMainWindow):
             preview_f = np.asarray(self.analysis_f[preview_start:], dtype=float)
             if len(preview_t) >= self.live_savgol_window_spin.value():
                 try:
-                    filtered, _ = filter_frequency(
+                    filtered, used_window = filter_frequency(
                         preview_t, preview_f, enabled=True,
                         window_length=self.live_savgol_window_spin.value(),
                         polyorder=self.live_savgol_order_spin.value())
                     preview_stride = max(1, len(preview_t) // 2500)
                     self.live_filtered_frequency_curve.setData(
                         preview_t[::preview_stride], filtered[::preview_stride])
+                    if self.live_residual_enabled.isChecked():
+                        # Subtract on identical samples before drawing decimation.
+                        # Omit the centered filter's provisional edge regions.
+                        radius = used_window // 2
+                        valid = slice(radius, len(preview_t) - radius, preview_stride)
+                        self.live_residual_curve.setData(
+                            preview_t[valid], (preview_f - filtered)[valid])
                 except ValueError:
                     self.live_filtered_frequency_curve.setData([], [])
+                    self.live_residual_curve.setData([], [])
+            else:
+                self.live_filtered_frequency_curve.setData([], [])
+                self.live_residual_curve.setData([], [])
         if self.plot_f:
             self.live_frequency_value.setText(f"{self.plot_f[-1]:,.3f} Hz")
         self._update_live_particle_markers()

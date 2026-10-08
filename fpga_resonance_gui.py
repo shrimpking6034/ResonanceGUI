@@ -83,6 +83,12 @@ class SweepWorker(QThread):
         self.settle_s = float(settle_s)
         self.samples_per_point = int(samples_per_point)
         self.stop_requested = False
+        self.last_result = {}
+
+    def _pause(self, seconds):
+        deadline = time.monotonic() + seconds
+        while not self.stop_requested and time.monotonic() < deadline:
+            self.msleep(max(1, min(20, int((deadline - time.monotonic()) * 1000))))
 
     def stop(self):
         self.stop_requested = True
@@ -97,6 +103,8 @@ class SweepWorker(QThread):
                     continue
                 words.extend(batch.values.tolist())
             self.msleep(5)
+        if self.stop_requested:
+            return None
         if len(words) < needed:
             raise RuntimeError(
                 f"mixdown payload 부족: {len(words)} words 수신, {needed} 필요. "
@@ -106,30 +114,43 @@ class SweepWorker(QThread):
         # no measured ADC-count-to-volt calibration in the supplied code.
         return raw[0::2] + 1j * raw[1::2]
 
-    def run(self):
+    def measure(self):
+        """Blocking segment acquisition; cleanup completes before returning.
+
+        May be called by an owning sequence worker without starting another
+        thread. last_result retains partial data even on stop or I/O failure.
+        """
         rows = []
+        requested = []
         hardware = isinstance(self.controller, FPGAController)
         try:
+            if self.stop_requested:
+                return
             if hardware:
                 self.controller.start_stream(signal="signed")
                 self.controller.apply_verified_sweep_preset(
                     float(self.frequencies[0]), float(self.frequencies[-1]),
                     self.parameters.drive_amplitude_fraction)
-                self.msleep(350)  # discard the captured preset's transition packets
+                self._pause(0.350)  # discard the captured preset's transition packets
                 self.controller.drain_stream(1000)
             else:
                 mode = replace(self.parameters.mode, run=False, send_data_to_pc=False,
                                run_nco_at_fixed_frequency=True)
                 self.controller.apply_parameters(replace(self.parameters, mode=mode))
+            if self.stop_requested:
+                return
             self.controller.start_fixed(stream=hardware)
             if hardware:
-                self.msleep(250)
+                self._pause(0.250)
                 self.controller.drain_stream(1000)
             for frequency in self.frequencies:
                 if self.stop_requested:
                     break
-                self.controller.set_fixed_frequency(float(frequency))
-                self.msleep(max(1, int(1000*self.settle_s)))
+                actual = self.controller.set_fixed_frequency(float(frequency))
+                actual = float(frequency) if actual is None else float(actual)
+                self._pause(max(0.001, self.settle_s))
+                if self.stop_requested:
+                    break
                 if hardware:
                     # Old packets may span the NCO transition. Only samples
                     # received after the requested settle interval belong to
@@ -138,24 +159,33 @@ class SweepWorker(QThread):
                     samples = self._hardware_complex_samples()
                 else:
                     samples = self.controller.complex_response(frequency, self.samples_per_point)
+                if samples is None or self.stop_requested:
+                    break
                 z, x_sem, y_sem, covariance, count = average_complex_samples(
                     samples.real, samples.imag)
-                rows.append((frequency, abs(z), np.angle(z, deg=True), z.real, z.imag,
+                requested.append(float(frequency))
+                rows.append((actual, abs(z), np.angle(z, deg=True), z.real, z.imag,
                              x_sem, y_sem, covariance, count))
-                self.point.emit(frequency, abs(z), np.angle(z, deg=True), z.real, z.imag)
+                self.point.emit(actual, abs(z), np.angle(z, deg=True), z.real, z.imag)
+        finally:
             names = ("freqs", "R", "theta", "X", "Y", "X_sem", "Y_sem", "XY_cov", "n_samples")
             columns = list(zip(*rows)) if rows else [[] for _ in names]
-            self.completed.emit({name: np.asarray(values, float)
-                                 for name, values in zip(names, columns)})
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        finally:
+            self.last_result = {name: np.asarray(values, float)
+                                for name, values in zip(names, columns)}
+            self.last_result["requested_freqs"] = np.asarray(requested, float)
             try:
                 self.controller.stop_output()
-            except Exception:
-                pass
-            if hardware:
-                self.controller.stop_stream()
+            finally:
+                if hardware:
+                    self.controller.stop_stream()
+        return self.last_result
+
+    def run(self):
+        try:
+            self.measure()
+            self.completed.emit(self.last_result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class FPGAWindow(QMainWindow):
@@ -247,7 +277,7 @@ class FPGAWindow(QMainWindow):
 
         warning = QLabel(
             "FPGA_Python의 검증 프로파일: UDP 5007, little-endian, channel A, "
-            "PLL 1차. Drive는 full-scale 비율이며 전압이 아닙니다. "
+            "Type-2 PI PLL의 목표 폐루프 응답 1차. Drive는 full-scale 비율이며 전압이 아닙니다. "
             "PIO 읽기는 설정값 확인에 사용할 수 없습니다.")
         warning.setWordWrap(True)
         warning.setStyleSheet("color: #9a5b00; padding: 8px;")

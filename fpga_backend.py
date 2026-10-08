@@ -94,7 +94,9 @@ class FPGAController:
         the only safe ordering supported without an atomic firmware command.
         """
         if parameters.loop_order != 1:
-            raise ValueError("deployed FPGA_Python profile verifies only first-order PLL")
+            raise ValueError(
+                "deployed FPGA_Python profile verifies only a first-order target response "
+                "for the type-2 PI PLL")
         if not 0 < parameters.minimum_frequency_hz <= parameters.maximum_frequency_hz < 6_250_000:
             raise ValueError("verified NCO profile requires frequencies in (0, 6.25 MHz)")
         safe_mode = ModeFields(**{

@@ -10,6 +10,7 @@ import time
 import csv
 from contextlib import contextmanager
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -19,11 +20,14 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QDoubleSpinBox,
 
 from fpga_backend import FPGAController
 from fpga_delay_calibration import positive_error_zero, refine_positive_error_zero
-from fpga_registers import ModeFields, PLLUserParameters, user_parameters_to_registers
+from fpga_pll_response import analyze_step_response, save_step_response
+from fpga_registers import (ModeFields, PLLUserParameters, pll_update_rate_hz,
+                            user_parameters_to_registers)
 from fpga_resonance_gui import SweepWorker as FPGASweepWorker
 from fpga_transport import NetworkProfile
 import resonance_gui as hf_module
 from resonance_gui import MainWindow
+from fpga_auto_sweep_gui import AutoSweepMixin
 
 
 class FPGAPlotterWorker(QThread):
@@ -227,10 +231,101 @@ class FPGADelayCalibrationWorker(QThread):
             self.completed.emit(result)
 
 
-class FPGAMainWindow(MainWindow):
-    """Reuse the HF2LI layout, fit, baseline, particle and DAQ workflows."""
+class FPGAClosedLoopStepWorker(QThread):
+    """Apply a small reversible delay step and record the PLL frequency."""
 
-    FPGA_STREAM_RATE_HZ = 3051.0  # from the working FPGA_Python data viewer
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, controller: FPGAController, base_delay_turns: float,
+                 step_turns: float, sample_rate_hz: float,
+                 baseline_s: float = 0.75, step_s: float = 1.50,
+                 recovery_s: float = 0.75):
+        super().__init__()
+        self.controller = controller
+        self.base_delay_turns = float(base_delay_turns) % 1.0
+        self.step_turns = float(step_turns)
+        self.sample_rate_hz = float(sample_rate_hz)
+        self.baseline_s = float(baseline_s)
+        self.step_s = float(step_s)
+        self.recovery_s = float(recovery_s)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def _write_delay(self, turns):
+        turns = float(turns) % 1.0
+        self.controller.write_named("delay", round(turns * (2**32 - 1)))
+
+    def _collect(self, duration_s):
+        values = []
+        deadline = time.monotonic() + duration_s
+        while time.monotonic() < deadline:
+            if self._stop:
+                raise RuntimeError("폐루프 step 응답 측정 중지")
+            receiver = self.controller.receiver
+            if receiver is not None and receiver.error is not None:
+                raise RuntimeError(f"FPGA UDP receiver: {receiver.error}")
+            for batch in self.controller.drain_stream(100):
+                if batch.channel == self.controller.channel:
+                    values.extend(np.asarray(batch.values, float).tolist())
+            self.msleep(5)
+        if not values:
+            raise TimeoutError("FPGA 주파수 응답 데이터가 수신되지 않았습니다.")
+        return np.asarray(values, dtype=float)
+
+    def run(self):
+        payload, failure = None, None
+        stepped_delay = (self.base_delay_turns + self.step_turns) % 1.0
+        try:
+            parameters = self.controller.last_parameters
+            if (parameters is None or not parameters.mode.run or
+                    parameters.mode.run_nco_at_fixed_frequency):
+                raise RuntimeError("FPGA PLL tracking이 실행 중이어야 합니다.")
+            self.controller.stop_stream()
+            self.controller.start_stream(signal="frequency")
+            self.controller.drain_stream(500)
+            self._write_delay(self.base_delay_turns)
+            baseline = self._collect(self.baseline_s)
+            self.controller.drain_stream(500)
+            self._write_delay(stepped_delay)
+            stepped = self._collect(self.step_s)
+            self.controller.drain_stream(500)
+            self._write_delay(self.base_delay_turns)
+            recovery = self._collect(self.recovery_s)
+            frequency = np.concatenate((baseline, stepped, recovery))
+            time_s = np.arange(len(frequency), dtype=float) / self.sample_rate_hz
+            step_time = len(baseline) / self.sample_rate_hz
+            restore_time = (len(baseline) + len(stepped)) / self.sample_rate_hz
+            segment = np.concatenate((
+                np.full(len(baseline), "baseline", dtype="U8"),
+                np.full(len(stepped), "step", dtype="U8"),
+                np.full(len(recovery), "recovery", dtype="U8"),
+            ))
+            payload = {
+                "time_s": time_s, "frequency_hz": frequency,
+                "segment": segment, "step_time_s": step_time,
+                "restore_time_s": restore_time,
+                "delay_step_turns": self.step_turns,
+                "base_delay_turns": self.base_delay_turns,
+            }
+        except Exception as exc:
+            failure = str(exc)
+        finally:
+            try:
+                self._write_delay(self.base_delay_turns)
+            except Exception as exc:
+                failure = f"원래 PLL delay 복구 실패: {exc}"
+            self.controller.stop_stream()
+        if failure:
+            self.failed.emit(failure)
+        else:
+            self.completed.emit(payload)
+
+
+class FPGAMainWindow(AutoSweepMixin, MainWindow):
+    """Reuse the HF2LI layout, fit, baseline, particle and DAQ workflows."""
 
     def __init__(self):
         self.fpga: FPGAController | None = None
@@ -238,9 +333,14 @@ class FPGAMainWindow(MainWindow):
         self._fpga_fixed_plotter = False
         self.fpga_error_worker = None
         self.fpga_delay_worker = None
+        self.fpga_response_worker = None
         self._start_pll_after_delay = False
         self._last_delay_calibration = None
+        self._last_step_response = None
+        self._last_step_response_context = None
+        self._restart_plotter_after_response = False
         super().__init__()
+        self._build_auto_results()
         self.sweep_samples_spin.setValue(max(256, self.sweep_samples_spin.value()))
         self.sweep_min_settle_spin.setValue(max(0.05, self.sweep_min_settle_spin.value()))
         self.setWindowTitle("Steel-Tube Resonator Control (FPGA + NI-DAQ)")
@@ -278,10 +378,11 @@ class FPGAMainWindow(MainWindow):
 
     def _settings_widgets(self):
         widgets = super()._settings_widgets()
+        widgets.update(self._auto_settings_widgets())
         widgets.update({name: getattr(self, name) for name in (
             "fpga_pll_delay_spin", "fpga_cic_rate_spin",
             "fpga_cic_shift_spin", "fpga_agc_check",
-            "fpga_auto_delay_check")})
+            "fpga_auto_delay_check", "fpga_step_size_spin")})
         return widgets
 
     def _save_last_settings(self):
@@ -338,11 +439,12 @@ class FPGAMainWindow(MainWindow):
                        self.sweep_avg_tc_spin, self.sweep_rate_spin):
             widget.setEnabled(False)
             widget.setToolTip("FPGA sweep는 고정된 CIC/lock-in 설정을 사용합니다.")
+        self._build_auto_controls(group)
         return group
 
     def _build_pll_group(self):
         group = super()._build_pll_group()
-        group.setTitle("4. FPGA PLL — 1차 loop")
+        group.setTitle("4. FPGA PLL — Type-2 PI · 목표 폐루프 응답 1차")
         self.pll_center_spin.setMaximum(6_249_999)
         self.pll_order_spin.setRange(1, 1)
         for widget in (self.pll_input_combo, self.pll_setpoint_spin,
@@ -375,7 +477,17 @@ class FPGAMainWindow(MainWindow):
         self.fpga_cic_rate_spin = QSpinBox()
         self.fpga_cic_rate_spin.setRange(16, 32767)
         self.fpga_cic_rate_spin.setValue(32767)
+        self.fpga_cic_rate_spin.setToolTip(
+            "낮출수록 PLL 갱신/UDP 샘플 속도가 증가합니다. "
+            "32767≈3.05 kSa/s, 16384≈6.10 kSa/s, 8192≈12.2 kSa/s. "
+            "변경 후 PLL을 다시 시작하고 안정성·노이즈를 확인하세요.")
         layout.addWidget(self.fpga_cic_rate_spin, row, 1)
+        row += 1
+        layout.addWidget(QLabel("예상 PLL/stream rate:"), row, 0)
+        self.fpga_rate_estimate_label = QLabel()
+        layout.addWidget(self.fpga_rate_estimate_label, row, 1)
+        self.fpga_cic_rate_spin.valueChanged.connect(self._update_fpga_rate_estimate)
+        self._update_fpga_rate_estimate()
         row += 1
         layout.addWidget(QLabel("FPGA CIC bit shift:"), row, 0)
         self.fpga_cic_shift_spin = QSpinBox()
@@ -398,7 +510,27 @@ class FPGAMainWindow(MainWindow):
         self.fpga_delay_calibrate_btn.clicked.connect(self.calibrate_fpga_pll_delay)
         layout.addWidget(self.fpga_delay_calibrate_btn, row, 0, 1, 2)
         row += 1
-        note = QLabel("선택 피크의 복소 fit f0·Q와 위 설정으로 FPGA 1차 PI 폐루프를 구성합니다. "
+        layout.addWidget(QLabel("폐루프 시험 delay step (turn):"), row, 0)
+        self.fpga_step_size_spin = QDoubleSpinBox()
+        self.fpga_step_size_spin.setRange(1 / 65536, 1 / 512)
+        self.fpga_step_size_spin.setDecimals(7)
+        self.fpga_step_size_spin.setSingleStep(1 / 4096)
+        self.fpga_step_size_spin.setValue(1 / 2048)
+        self.fpga_step_size_spin.setToolTip(
+            "PLL tracking 중 delay에 가하는 작은 양의 step입니다. 최대 1/512 turn으로 제한됩니다.")
+        layout.addWidget(self.fpga_step_size_spin, row, 1)
+        row += 1
+        self.fpga_step_response_btn = QPushButton("실제 폐루프 step 응답 · BW 측정")
+        self.fpga_step_response_btn.clicked.connect(self.measure_fpga_step_response)
+        layout.addWidget(self.fpga_step_response_btn, row, 0, 1, 2)
+        row += 1
+        self.fpga_step_response_label = QLabel("실측 폐루프 BW: 아직 측정하지 않았습니다.")
+        self.fpga_step_response_label.setWordWrap(True)
+        self.fpga_step_response_label.setStyleSheet("color: #555;")
+        layout.addWidget(self.fpga_step_response_label, row, 0, 1, 2)
+        row += 1
+        note = QLabel("선택 피크의 복소 fit f0·Q와 위 설정으로 FPGA Type-2 PI PLL을 구성하고, "
+                      "공진기를 포함한 목표 응답을 1차 저역통과로 설정합니다. "
                       "원시 error stream은 선택 수신할 수 있지만 HF2LI의 ° 단위 ERROR와 같지 않습니다. "
                       "lock bit는 확인되지 않았습니다.")
         note.setWordWrap(True)
@@ -407,12 +539,30 @@ class FPGAMainWindow(MainWindow):
 
     def _build_plotter_group(self):
         group = super()._build_plotter_group()
-        self.plotter_rate_spin.setValue(self.FPGA_STREAM_RATE_HZ)
+        # The HF2LI widget is capped at 7.2 kSa/s.  The FPGA CIC can update
+        # much faster, so widen the display-only range before assigning it.
+        self.plotter_rate_spin.setRange(1.0, pll_update_rate_hz(16))
+        self.plotter_rate_spin.setDecimals(2)
+        self.plotter_rate_spin.setValue(pll_update_rate_hz(32767))
         self.plotter_rate_spin.setEnabled(False)
-        self.plotter_rate_spin.setToolTip("FPGA stream rate는 기존 Python 코드의 3051 Sa/s 가정입니다.")
+        self.plotter_rate_spin.setToolTip(
+            "100 MHz / CIC rate로 계산한 FPGA PLL 갱신 속도입니다. "
+            "현재 mode의 추가 datarate decimation은 0입니다.")
         return group
 
+    def _expected_fpga_stream_rate_hz(self):
+        return pll_update_rate_hz(self.fpga_cic_rate_spin.value())
+
+    def _update_fpga_rate_estimate(self, *_args):
+        rate = self._expected_fpga_stream_rate_hz()
+        self.fpga_rate_estimate_label.setText(f"{rate:,.2f} Sa/s")
+        if hasattr(self, "plotter_rate_spin"):
+            self.plotter_rate_spin.setValue(rate)
+
     def _connect_hardware(self):
+        if self._auto_busy():
+            self.status_label.setText("자동 스윕 종료 후 재연결할 수 있습니다.")
+            return
         if self.fpga is not None:
             try:
                 self.emergency_stop()
@@ -430,6 +580,8 @@ class FPGAMainWindow(MainWindow):
             self.status_label.setText(f"FPGA 연결 실패: {exc}")
 
     def set_drive_amplitude_value(self, fraction):
+        if self._auto_busy():
+            return
         if self.fpga and self.fpga.last_parameters and self.output_on_btn.isChecked() and self.amp_enable_btn.isChecked():
             self.fpga.write_named("nco_gain", round(float(fraction) * 0xFFFFFFFF))
 
@@ -437,6 +589,8 @@ class FPGAMainWindow(MainWindow):
         del index  # HF2LI output range has no FPGA equivalent.
 
     def _write_drive_switches(self):
+        if self._auto_busy():
+            return
         if self.fpga and self.fpga.last_parameters:
             fraction = (self.drive_v_spin.value()
                         if self.output_on_btn.isChecked() and self.amp_enable_btn.isChecked()
@@ -599,6 +753,110 @@ class FPGAMainWindow(MainWindow):
         if "중지" not in message:
             QMessageBox.warning(self, "FPGA PLL delay 보정 실패", message)
 
+    def measure_fpga_step_response(self):
+        """Measure the real resonator-PLL response instead of trusting target BW."""
+        if self.fpga is None:
+            QMessageBox.warning(self, "폐루프 응답", "FPGA 연결이 필요합니다.")
+            return
+        if not self.pll_enable_btn.isChecked():
+            QMessageBox.warning(self, "폐루프 응답", "먼저 FPGA PLL tracking을 활성화하세요.")
+            return
+        if ((self.sweep_worker and self.sweep_worker.isRunning()) or
+                (self.fpga_error_worker and self.fpga_error_worker.isRunning()) or
+                (self.fpga_delay_worker and self.fpga_delay_worker.isRunning()) or
+                (self.fpga_response_worker and self.fpga_response_worker.isRunning())):
+            QMessageBox.warning(self, "폐루프 응답", "다른 FPGA 측정이 끝난 뒤 실행하세요.")
+            return
+        if self.baseline_active or self.pingpong_active:
+            QMessageBox.warning(self, "폐루프 응답", "Baseline 또는 Ping-Pong 시험을 먼저 중지하세요.")
+            return
+        parameters = self.fpga.last_parameters
+        if (parameters is None or not parameters.mode.run or
+                parameters.mode.run_nco_at_fixed_frequency):
+            QMessageBox.warning(self, "폐루프 응답", "FPGA가 tracking 모드인지 확인하세요.")
+            return
+        self._restart_plotter_after_response = bool(
+            self.plotter_worker and self.plotter_worker.isRunning())
+        if self._restart_plotter_after_response:
+            self.stop_plotter()
+        self.fpga_response_worker = FPGAClosedLoopStepWorker(
+            self.fpga, self.fpga_pll_delay_spin.value(),
+            self.fpga_step_size_spin.value(), self._expected_fpga_stream_rate_hz())
+        self.fpga_response_worker.completed.connect(self._on_fpga_step_response)
+        self.fpga_response_worker.failed.connect(self._on_fpga_step_response_failed)
+        self.fpga_step_response_btn.setEnabled(False)
+        self.fpga_step_response_btn.setText("폐루프 step 응답 측정 중…")
+        self.fpga_step_response_label.setText(
+            "작은 delay step을 적용해 실제 주파수 응답을 기록하고 있습니다…")
+        self.fpga_response_worker.start()
+
+    def _finish_fpga_step_response_worker(self):
+        if self.fpga_response_worker:
+            self.fpga_response_worker.wait(1000)
+        self.fpga_response_worker = None
+        self.fpga_step_response_btn.setEnabled(True)
+        self.fpga_step_response_btn.setText("실제 폐루프 step 응답 · BW 측정")
+        restart = self._restart_plotter_after_response
+        self._restart_plotter_after_response = False
+        if restart and self.pll_enable_btn.isChecked():
+            self.start_plotter()
+
+    def _on_fpga_step_response(self, payload):
+        try:
+            result = analyze_step_response(
+                payload["time_s"], payload["frequency_hz"],
+                step_time_s=payload["step_time_s"],
+                restore_time_s=payload["restore_time_s"],
+                delay_step_turns=payload["delay_step_turns"],
+            )
+            parameters = self.fpga.last_parameters if self.fpga else None
+            metadata = {
+                "step_time_s": payload["step_time_s"],
+                "restore_time_s": payload["restore_time_s"],
+                "base_delay_turns": payload["base_delay_turns"],
+                "target_bandwidth_hz": (
+                    parameters.loop_bandwidth_hz if parameters else self.pll_target_bw_spin.value()),
+                "center_frequency_hz": self.pll_center_spin.value(),
+                "resonator_q": self.pll_q_spin.value(),
+                "cic_rate": self.fpga_cic_rate_spin.value(),
+                "cic_bit_shift": self.fpga_cic_shift_spin.value(),
+                "agc_enabled": self.fpga_agc_check.isChecked(),
+                "stream_rate_hz_expected_from_cic": self._expected_fpga_stream_rate_hz(),
+            }
+            self._last_step_response = result
+            self._last_step_response_context = dict(metadata)
+            csv_path, json_path, png_path = save_step_response(
+                Path(__file__).resolve().parent / "diagnostics",
+                payload["time_s"], payload["frequency_hz"], payload["segment"],
+                result, metadata)
+            target = float(metadata["target_bandwidth_hz"])
+            ratio = result.bandwidth_hz / target if target > 0 else np.nan
+            status = "통과" if result.accepted else "검토 필요"
+            self.fpga_step_response_label.setText(
+                f"실측 BW={result.bandwidth_hz:.3g} Hz / Target={target:.3g} Hz "
+                f"(비={ratio:.3f}), τ={result.tau_s:.4g} s, "
+                f"overshoot={result.overshoot_percent:.1f}%, R²={result.r_squared:.3f} · {status}")
+            details = (
+                self.fpga_step_response_label.text() +
+                f"\n\nCSV: {csv_path}\nJSON: {json_path}\n그래프: {png_path}")
+            if result.reasons:
+                details += "\n\n" + "\n".join(f"• {reason}" for reason in result.reasons)
+            if result.accepted:
+                QMessageBox.information(self, "FPGA 폐루프 응답 측정 완료", details)
+            else:
+                QMessageBox.warning(self, "FPGA 폐루프 응답 검토 필요", details)
+        except Exception as exc:
+            self.fpga_step_response_label.setText(f"폐루프 응답 분석 실패: {exc}")
+            QMessageBox.warning(self, "폐루프 응답 분석 실패", str(exc))
+        finally:
+            self._finish_fpga_step_response_worker()
+
+    def _on_fpga_step_response_failed(self, message):
+        self.fpga_step_response_label.setText(f"폐루프 step 응답 측정 실패: {message}")
+        self._finish_fpga_step_response_worker()
+        if "중지" not in message:
+            QMessageBox.warning(self, "폐루프 step 응답 측정 실패", message)
+
     def run_sweep(self):
         if self.fpga is None:
             self.status_label.setText("FPGA 연결이 필요합니다.")
@@ -707,6 +965,9 @@ class FPGAMainWindow(MainWindow):
                 self._start_fpga_closed_loop()
         else:
             self._start_pll_after_delay = False
+            if self.fpga_response_worker and self.fpga_response_worker.isRunning():
+                self.fpga_response_worker.stop()
+                self.fpga_response_worker.wait(3000)
             if self.fpga_delay_worker and self.fpga_delay_worker.isRunning():
                 self.fpga_delay_worker.stop()
                 self.fpga_delay_worker.wait(3000)
@@ -753,7 +1014,12 @@ class FPGAMainWindow(MainWindow):
             QMessageBox.critical(self, "FPGA PLL 시작 실패", str(exc))
 
     def start_plotter(self, baseline=False):
+        if self._auto_busy():
+            return
         if self.fpga is None or (self.plotter_worker and self.plotter_worker.isRunning()):
+            return
+        if self.fpga_response_worker and self.fpga_response_worker.isRunning():
+            QMessageBox.warning(self, "폐루프 응답", "step 응답 측정이 끝난 뒤 Plotter를 시작하세요.")
             return
         if self.fpga_error_worker and self.fpga_error_worker.isRunning():
             QMessageBox.warning(self, "FPGA error 진단", "진단이 끝난 뒤 Plotter를 시작하세요.")
@@ -811,7 +1077,8 @@ class FPGAMainWindow(MainWindow):
         self.live_filtered_frequency_curve.setData([], [])
         self.reset_live_particle_detector()
         self.tabs.setCurrentIndex(4 if baseline else 3)
-        self.plotter_worker = FPGAPlotterWorker(self.fpga, self.FPGA_STREAM_RATE_HZ)
+        self.plotter_worker = FPGAPlotterWorker(
+            self.fpga, self._expected_fpga_stream_rate_hz())
         worker = self.plotter_worker
         worker.batch_ready.connect(
             lambda batch, source=worker: self._on_current_plotter_batch(source, batch))
@@ -859,11 +1126,24 @@ class FPGAMainWindow(MainWindow):
         parameters = self.fpga.last_parameters if self.fpga else None
         gains = (user_parameters_to_registers(parameters)
                  if parameters is not None else None)
+        response_context = self._last_step_response_context or {}
+        response_current = bool(
+            self._last_step_response and parameters and
+            abs(response_context.get("target_bandwidth_hz", np.inf) -
+                parameters.loop_bandwidth_hz) < 1e-9 and
+            abs(response_context.get("center_frequency_hz", np.inf) -
+                parameters.frequency_hz) < 0.1 and
+            abs(response_context.get("base_delay_turns", np.inf) -
+                parameters.pll_delay_turns) < 1e-6 and
+            response_context.get("cic_rate") == parameters.cic_rate and
+            response_context.get("cic_bit_shift") == parameters.cic_bit_shift and
+            response_context.get("agc_enabled") == parameters.mode.enable_agc)
         metadata.update({
             "Backend": "SMR FPGA channel A",
             "Acquisition_mode": "UDP PLL frequency; host reconstructed time",
             "PLL_status_logging": "lock bit unavailable; raw error requires a separate selected UDP stream",
-            "PLL_update_rate_Hz": "unverified",
+            "PLL_update_rate_Hz_expected_from_CIC": self._expected_fpga_stream_rate_hz(),
+            "FPGA_PLL_datarate_decimation": 0,
             "PLL_Kp_Hz_per_deg": np.nan,
             "PLL_Ki_Hz2_per_deg": np.nan,
             "PLL_Kd_per_deg": np.nan,
@@ -893,17 +1173,26 @@ class FPGAMainWindow(MainWindow):
             "FPGA_PLL_raw_error_at_calibration_counts": (
                 self._last_delay_calibration["error_counts"]
                 if self._last_delay_calibration else np.nan),
+            "FPGA_PLL_measured_closed_loop_bandwidth_Hz": (
+                self._last_step_response.bandwidth_hz
+                if response_current else np.nan),
+            "FPGA_PLL_measured_step_tau_s": (
+                self._last_step_response.tau_s
+                if response_current else np.nan),
+            "FPGA_PLL_step_response_accepted": (
+                self._last_step_response.accepted
+                if response_current else False),
             "Amplitude_R_unit": "unavailable in simultaneous frequency stream",
         })
         return metadata
 
     def on_plotter_stream_started(self, requested_rate_hz, assumed_rate_hz):
         self.plotter_actual_rate_hz = float(assumed_rate_hz)
-        self.measurement_metadata["FPGA_stream_rate_Hz_assumed"] = float(assumed_rate_hz)
+        self.measurement_metadata["FPGA_stream_rate_Hz_expected_from_CIC"] = float(assumed_rate_hz)
         self.measurement_metadata["Demod_stream_rate_Hz_actual"] = np.nan
         self.measurement_metadata["Demod_stream_rate_Hz_requested"] = np.nan
         self.plotter_actual_rate_label.setText(
-            f"FPGA 시간축 가정: {assumed_rate_hz:,.0f} Sa/s (실측 미검증)")
+            f"FPGA CIC 계산 속도: {assumed_rate_hz:,.2f} Sa/s (실측 미검증)")
 
     def _record_plotter_sample(self, t, r, theta, f, x, y, locked,
                                phase_error, correction, demod_latency, pll_latency):
@@ -971,6 +1260,9 @@ class FPGAMainWindow(MainWindow):
         if self.fpga_delay_worker:
             self.fpga_delay_worker.stop()
             self.fpga_delay_worker.wait(3000)
+        if self.fpga_response_worker:
+            self.fpga_response_worker.stop()
+            self.fpga_response_worker.wait(3000)
         if self.plotter_worker:
             self.plotter_worker.stop()
             self.plotter_worker.wait(1000)
@@ -990,6 +1282,11 @@ class FPGAMainWindow(MainWindow):
         self.status_label.setText(self.status_label.text() + " [긴급 정지 실행됨]")
 
     def closeEvent(self, event):
+        if self._auto_busy():
+            self.stop_auto_sweep()
+            event.ignore()
+            self.auto_status.setText("자동 스윕 중지·저장 중입니다. 완료 후 창을 닫아주세요.")
+            return
         super().closeEvent(event)
         if not event.isAccepted():
             return

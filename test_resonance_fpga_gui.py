@@ -134,7 +134,7 @@ class SameLayoutFPGATests(unittest.TestCase):
         with patch.object(FPGAMainWindow, "_connect_hardware", connect):
             window = FPGAMainWindow()
         try:
-            self.assertEqual(window.tabs.count(), 5)
+            self.assertEqual(window.tabs.count(), 6)
             self.assertEqual(window.pll_order_spin.value(), 1)
             self.assertFalse(window.input_range_spins[0].isEnabled())
             window.f_start_spin.setValue(117000)
@@ -160,6 +160,9 @@ class SameLayoutFPGATests(unittest.TestCase):
             window.pll_range_spin.setValue(1000)
             window.pll_q_spin.setValue(150)
             window.fpga_pll_delay_spin.setValue(0.125)
+            window.fpga_cic_rate_spin.setValue(8192)
+            self.assertAlmostEqual(window.plotter_rate_spin.value(), 100e6 / 8192,
+                                   places=1)
             window.fpga_cic_rate_spin.setValue(16384)
             window.fpga_cic_shift_spin.setValue(20)
             window.fpga_agc_check.setChecked(True)
@@ -250,6 +253,38 @@ class SameLayoutFPGATests(unittest.TestCase):
             self.assertLess(window.live_particle_plot.viewRange()[0][0], 1)
             self.assertGreater(len(window.live_frequency_curve.getData()[0]), 0)
             self.assertGreater(len(window.live_filtered_frequency_curve.getData()[0]), 0)
+        finally:
+            window.close()
+
+    def test_live_residual_is_aligned_and_display_only(self):
+        from live_savgol import filter_frequency
+        with patch.object(FPGAMainWindow, "_connect_hardware", lambda w: None):
+            window = FPGAMainWindow()
+        try:
+            window.live_savgol_enabled.setChecked(False)
+            window.live_residual_enabled.setChecked(True)
+            self.assertTrue(window.live_savgol_window_spin.isEnabled())
+            self.assertFalse(window.live_savgol_enabled.isChecked())
+            t = np.linspace(0, 1, 1001)
+            f = 38000 + t + .1 * np.sin(2 * np.pi * 70 * t)
+            window.analysis_t = t.tolist()
+            window.analysis_f = f.tolist()
+            for name, values in [('plot_t', t), ('plot_f', f), ('plot_R', t*0),
+                                 ('plot_theta', t*0), ('plot_x', t*0), ('plot_y', t*0)]:
+                setattr(window, name, values.tolist())
+            with patch.object(window, '_update_live_particle_markers'):
+                window._refresh_plotter_ui(1.)
+            expected, n = filter_frequency(t, f, True, 27, 4)
+            tx, residual = window.live_residual_curve.getData()
+            np.testing.assert_array_equal(tx, t[n//2:-(n//2)])
+            np.testing.assert_allclose(residual, (f-expected)[n//2:-(n//2)])
+            np.testing.assert_array_equal(window.plot_f, f)
+            window.live_savgol_order_spin.setValue(3)
+            cleared = window.live_residual_curve.getData()[0]
+            self.assertTrue(cleared is None or len(cleared) == 0)
+            window.live_residual_enabled.setChecked(False)
+            self.assertTrue(window.live_residual_plot.isHidden())
+            self.assertFalse(window.live_savgol_window_spin.isEnabled())
         finally:
             window.close()
 

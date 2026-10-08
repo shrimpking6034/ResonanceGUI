@@ -83,7 +83,7 @@ def three_db_bounds(frequency_hz, smoothed_amplitude, peak_index):
     li = int(left[-1])
     ri = int(p + 1 + right[0])
     left_hz = float(np.interp(level, r[li:li + 2], f[li:li + 2]))
-    right_hz = float(np.interp(level, r[ri - 1:ri][::-1], f[ri - 1:ri][::-1]))
+    right_hz = float(np.interp(level, r[ri - 1:ri + 1][::-1], f[ri - 1:ri + 1][::-1]))
     return left_hz, right_hz
 
 
@@ -151,7 +151,8 @@ def model_response(frequency_hz, parameters, center_hz=None, resonance_sign=1):
 
 
 def fit_complex_resonance(frequency_hz, x, y, x_sem=None, y_sem=None,
-                          f0_guess=None, f0_bounds=None):
+                          f0_guess=None, f0_bounds=None, cancel_check=None,
+                          max_nfev=5000):
     """Fit one complex resonance, automatically selecting its I/Q convention.
 
     Both denominator signs are compared using weighted least-squares cost
@@ -213,6 +214,8 @@ def fit_complex_resonance(frequency_hz, x, y, x_sem=None, y_sem=None,
     sy = np.maximum(sy, amplitude_scale * 1e-9)
 
     def residuals(p, resonance_sign):
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("복소 fitting 중지됨")
         model = model_response(f, p, center, resonance_sign)
         return np.concatenate(((model.real - z.real) / sx, (model.imag - z.imag) / sy))
 
@@ -234,7 +237,7 @@ def fit_complex_resonance(frequency_hz, x, y, x_sem=None, y_sem=None,
             start[1] = np.clip(np.log(q_seed), lower[1] + 1e-12, upper[1] - 1e-12)
             candidate = least_squares(
                 residuals, start, args=(resonance_sign,), bounds=(lower, upper), loss="linear",
-                max_nfev=5000, x_scale=x_scale,
+                max_nfev=max_nfev, x_scale=x_scale,
             )
             if preliminary is None or candidate.cost < preliminary.cost:
                 preliminary = candidate
@@ -249,7 +252,7 @@ def fit_complex_resonance(frequency_hz, x, y, x_sem=None, y_sem=None,
     robust_scale = max(residual_sigma, 0.05 * residual_rms, np.finfo(float).eps)
     result = least_squares(
         residuals, preliminary.x, args=(selected_sign,), bounds=(lower, upper), loss="soft_l1",
-        f_scale=robust_scale, max_nfev=5000, x_scale=x_scale,
+        f_scale=robust_scale, max_nfev=max_nfev, x_scale=x_scale,
     )
     p = result.x
     q = float(np.exp(p[1]))

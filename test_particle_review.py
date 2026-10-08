@@ -276,6 +276,14 @@ class ExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             result,count=export_event_figures(d,[event,dict(event,family='wide')],folder,'raw.csv',1.1,True,review_context={'metadata':{'Fluid':'DI'},'thresholds':[{'threshold_hz':.15}]})
             self.assertEqual(count,2)
+            panels=list((result/'publication').glob('*'))
+            self.assertEqual(len(panels),24)
+            for quantity in ('frequency','phase','amplitude','pressure'):
+                for extension in ('png','pdf','svg'):
+                    self.assertEqual(len(list((result/'publication').glob(f'*_{quantity}.{extension}'))),2)
+            with Image.open(next((result/'publication').glob('*_frequency.png'))) as im:
+                self.assertAlmostEqual(im.width,90/25.4*600,delta=1)
+                self.assertEqual(im.width,im.height)
             images=list(result.glob('*.png')); self.assertEqual(len(images),2)
             for image in images:
                 with Image.open(image) as im:self.assertGreater(im.width,1000)
