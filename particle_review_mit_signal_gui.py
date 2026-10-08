@@ -39,6 +39,7 @@ class MitSignalPanel(QtWidgets.QWidget):
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.table.itemSelectionChanged.connect(self.draw); layout.addWidget(self.table,1)
+        self.quality=QtWidgets.QLabel('');self.quality.setWordWrap(True);layout.addWidget(self.quality)
         # The two charts share the available width, giving the frequency plot a
         # near-square viewport in the normal review-window size.
         self.graph=pg.GraphicsLayoutWidget(); layout.addWidget(self.graph,3)
@@ -58,6 +59,7 @@ class MitSignalPanel(QtWidgets.QWidget):
 
     def invalidate(self):
         self.analysis=None;self.table.setRowCount(0);self.raw.clear();self.residual.clear()
+        self.quality.clear()
         self.info.setText('후보 또는 SG/MIT 설정이 바뀌었습니다. 분석을 다시 실행하세요.');self.save_btn.setEnabled(False)
 
     def set_result(self,analysis,source=None,metadata=None):
@@ -84,6 +86,9 @@ class MitSignalPanel(QtWidgets.QWidget):
         row=self.table.currentRow()
         if row<0:return
         event_index=int(self.analysis['summary'].iloc[row].event_index)
+        summary=self.analysis['summary'].iloc[row]
+        self.quality.setText(f"Baseline RMSE {summary.get('baseline_rmse_hz',np.nan):.5f} Hz · 검출용 SG σ {summary.get('detection_sigma_sg_hz',np.nan):.5f} Hz · 간격 CV {summary.get('antinode_spacing_cv',np.nan):.3f} · SG/간격 {summary.get('sg_spacing_ratio',np.nan):.2f}\n{summary.warning}")
+        if summary.get('noise_warning',''):self.quality.setText(self.quality.text()+'\nNoise: '+str(summary.noise_warning))
         tr=self.analysis['traces'];tr=tr[tr.event_index==event_index]
         if not len(tr):return
         self.raw.plot(tr.time_s.to_numpy(),tr.raw_hz.to_numpy(),pen='#aaaaaa')
@@ -106,6 +111,9 @@ class MitSignalPanel(QtWidgets.QWidget):
             brush='#8e44ad' if manual else '#175aaa'
             self.raw.plot(a.time_s.to_numpy(),a.frequency_hz.to_numpy(),pen=None,symbol='o',symbolBrush=brush,symbolSize=7)
             self.residual.plot(a.time_s.to_numpy(),a.delta_hz.to_numpy(),pen=None,symbol='o',symbolBrush=brush,symbolSize=7)
+            if 'fit_rmse_hz' in a:
+                fit=a[a.fit_rmse_hz.notna()]
+                self.quality.setText(self.quality.text()+'\n외곽 2차 fit RMSE: '+', '.join(f'#{int(r.antinode_index)} {r.fit_rmse_hz:.5f} Hz' for r in fit.itertuples())+' (SG 잔차, 통계적 신뢰구간 아님)')
         self.residual.plot(tr.time_s.to_numpy(),tr.residual_hz.to_numpy(),pen='#238b57')
         self.residual.addLine(y=0,pen=pg.mkPen('#606060',style=QtCore.Qt.DashLine))
         self.manual_time.setRange(float(tr.time_s.min()),float(tr.time_s.max()))

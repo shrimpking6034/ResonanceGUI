@@ -195,6 +195,10 @@ class ReviewWindow(QtWidgets.QMainWindow):
         self.mit_signal_panel.manualAntinodesRequested.connect(self.set_manual_antinode_times)
         self.mit_signal_panel.automaticAntinodesRequested.connect(self.restore_automatic_antinodes)
         self.mit_signal_panel.sensitivityRequested.connect(self.compare_mit_sensitivity)
+        self.savgol_panel.order.valueChanged.connect(self.mit_signal_panel.invalidate)
+        self.savgol_panel.window.valueChanged.connect(self.mit_signal_panel.invalidate)
+        self.mit_guard.valueChanged.connect(self.mit_signal_panel.invalidate)
+        self.mit_min_duration.valueChanged.connect(self.mit_signal_panel.invalidate)
         self.overview=pg.PlotWidget(); self.overview.setLabel('left','Frequency',units='Hz'); self.overview.setLabel('bottom','Time',units='s')
         self.overview.getAxis('left').enableAutoSIPrefix(False)
         self.overview.setMaximumHeight(220); rl.addWidget(self.overview)
@@ -763,7 +767,7 @@ class ReviewWindow(QtWidgets.QMainWindow):
         event=self.events[index-1]
         manual={1:event['_mit_manual_antinode_times']} if '_mit_manual_antinode_times' in event else None
         try:
-            result=compare_mit_signal_settings(self.data,[event],self.get_mit_signal_settings(),manual)
+            result=compare_mit_signal_settings(self.data,[event],self.get_mit_signal_settings(),manual,exclusion_events=self.events)
             result['event_index']=index
             existing=panel.analysis.get('sensitivity',pd.DataFrame())
             if len(existing):existing=existing[existing.event_index!=index]
@@ -844,6 +848,8 @@ class ReviewWindow(QtWidgets.QMainWindow):
             mss=info.get('mit_signal_settings')
             if mss:
                 self.mit_prominence.setValue(mss.get('prominence_sigma',2.0));self.mit_local_fit.setValue(mss.get('local_fit_fraction',.20))
+                self.mit_signal_panel.baseline_degree.setValue(mss.get('baseline_degree',3))
+                self.mit_signal_panel.baseline_guard.setValue(1000*mss.get('baseline_guard_s',0.))
             ps=info.get('particle_property_settings')
             if ps:
                 self.mode_number.setValue(ps.get('mode_number',6)); self.diameter_min.setValue(ps.get('diameter_min_um',190)); self.diameter_max.setValue(ps.get('diameter_max_um',220))

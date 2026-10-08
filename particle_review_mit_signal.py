@@ -49,15 +49,14 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
                        local_fit_fraction=0.20, antinode_count=7,
                        outer_tolerance_percent=20.0, noise_guard_s=.10,
                        noise_min_duration_s=1.0, manual_antinode_times=None,
-                       baseline_degree=3, baseline_guard_s=0.0, compute_noise=True):
+                       baseline_degree=3, baseline_guard_s=0.0, compute_noise=True,
+                       exclusion_events=None):
     """Analyze reviewed transits following the paper's stated frequency pipeline.
 
-    Stated values: seven antinodes, cubic immediate baseline, baseline length
-    three times the first-to-second antinode interval, local quadratic extrema,
-    outer-antinode agreement <=20%, and 1-Hz order-2 HP baseline noise.
-    Inferred defaults for the supplied recording: SG 4/27, prominence 2 sigma,
-    local-fit half width 20%
-    of the median antinode interval, and the mean of the two outer deltas.
+    Paper reference: seventh mode, cubic baseline, 3x first spacing, quadratic
+    extrema, 20% outer agreement and 1-Hz order-2 HP noise. Implementation
+    extensions: mode selection, full-transit/SG-support exclusion, residual
+    fitting, fit validation, and explicitly labelled single-event local noise.
     """
     if not events:
         raise ValueError('MIT 피크 분석에는 검토 후보가 필요합니다.')
@@ -68,6 +67,7 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
     if baseline_degree not in (1,2,3) or baseline_guard_s<0:
         raise ValueError('baseline 차수는 1–3, 추가 guard는 0 이상이어야 합니다.')
     manual_antinode_times=manual_antinode_times or {}
+    excluded=events if exclusion_events is None else exclusion_events
     t=data.Time_s.to_numpy(dtype=float); raw=data.Frequency_Hz.to_numpy(dtype=float)
     if sg_window>len(t):
         raise ValueError('SG window가 데이터 길이보다 큽니다.')
@@ -82,7 +82,7 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
         if not np.isfinite([start,end]).all() or end<=start:
             rows.append(_empty(index,event,'invalid_event','유효한 이벤트 시작/끝이 필요합니다.')); continue
         approximate_spacing=max((end-start)/max(1,antinode_count-1),4*median_dt)
-        outside=_baseline_mask(t,events,start,end,baseline_multiplier*approximate_spacing,guard)
+        outside=_baseline_mask(t,excluded,start,end,baseline_multiplier*approximate_spacing,guard)
         inside=(t>=start)&(t<=end)
         if np.count_nonzero(outside&(t<start))<6 or np.count_nonzero(outside&(t>end))<6 or np.count_nonzero(inside)<antinode_count*3:
             rows.append(_empty(index,event,'insufficient_samples','3차 baseline 또는 이벤트 표본이 부족합니다.')); continue
@@ -92,13 +92,14 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
         down_strength=float(-np.min(residual[inside])); up_strength=float(np.max(residual[inside]))
         direction='down' if down_strength>=up_strength else 'up'; sign=-1 if direction=='down' else 1
         baseline_residual=(smooth-baseline)[outside]
-    sigma=max(robust_sigma(baseline_residual),np.finfo(float).eps)
+        sigma=max(robust_sigma(baseline_residual),np.finfo(float).eps*max(1.,float(np.max(np.abs(raw))))*100)
         ids=np.flatnonzero(inside); target=sign*residual[inside]
         distance=max(1,int(round(.40*approximate_spacing/median_dt)))
         requested=manual_antinode_times.get(index,manual_antinode_times.get(str(index)))
         selection_source='manual' if requested is not None else 'auto'
         if requested is None:
-            peaks,properties=find_peaks(target,distance=distance,prominence=prominence_sigma*sigma)
+            peaks,properties=find_peaks(target,distance=distance,prominence=prominence_sigma*sigma,
+                                        height=prominence_sigma*sigma)
             peak_ids=ids[peaks]
         else:
             requested=np.asarray(requested,dtype=float)
@@ -126,7 +127,7 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
                        if len(peak_ids)>1 else float(approximate_spacing))
         median_spacing=(float(np.median(np.diff(t[peak_ids])))
                         if len(peak_ids)>1 else float(approximate_spacing))
-        outside=_baseline_mask(t,events,start,end,baseline_multiplier*first_spacing,guard)
+        outside=_baseline_mask(t,excluded,start,end,baseline_multiplier*first_spacing,guard)
         if np.count_nonzero(outside&(t<start))<6 or np.count_nonzero(outside&(t>end))<6:
             rows.append(_empty(index,event,'baseline_failed','명시된 3× antinode 간격 baseline 표본이 부족합니다.')); continue
         coef=np.polyfit(x[outside],smooth[outside],baseline_degree); baseline=np.polyval(coef,x); residual=smooth-baseline
@@ -152,11 +153,15 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
                                       fit_rmse_hz=rmse,
                                       selection_source=selection_source))
         except ValueError as exc:
-            rows.append(_empty(index,event,'quadratic_failed',str(exc))); continue
+            row=_empty(index,event,'quadratic_failed',str(exc))
+            row.update(antinode_count=len(peak_ids),direction=direction,selection_source=selection_source)
+            rows.append(row); continue
         first_delta=fitted[0][3]; last_delta=fitted[-1][3]; mean_delta=(first_delta+last_delta)/2
         relative=abs(first_delta-last_delta)/abs(mean_delta)*100 if mean_delta else np.inf
         status='ok' if relative<=outer_tolerance_percent and first_delta>0 and last_delta>0 else 'outer_mismatch'
         warning='' if status=='ok' else f'첫/마지막 antinode 차이 {relative:.1f}% > {outer_tolerance_percent:g}% 또는 부호 이상'
+        if any(point[3]<=sigma for point in fitted):
+            status='invalid_shape';warning+=' · baseline 대비 유의한 깊이가 없는 antinode: 정량 채택 보류'
         if sg_window/fs>median_spacing*.35:warning+=' · SG window가 antinode 간격의 35% 초과: window 민감도 확인'
         spacing_cv=float(np.std(np.diff(t[peak_ids]))/median_spacing) if len(peak_ids)>1 else 0.
         if spacing_cv>.3:warning+=' · antinode 간격 불균일: 모드 형상/압력 전환 확인'
@@ -173,6 +178,7 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
                          mean_delta_hz=mean_delta,relative_difference_percent=relative,
                          mit_noise_sigma_hz=np.nan,snr_mit=np.nan,status=status,warning=warning.strip(' ·'),
                          baseline_rmse_hz=float(np.sqrt(np.mean(residual[outside]**2))),
+                         detection_sigma_sg_hz=sigma,
                          antinode_spacing_cv=spacing_cv,sg_spacing_ratio=sg_window/fs/median_spacing,
                          baseline_guard_s=guard))
         rows[-1]['selection_source']=selection_source
@@ -188,6 +194,8 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
         sigma=float(noise['summary']['pooled_sigma_hz'])
         summary['mit_noise_sigma_hz']=sigma
         summary['snr_mit']=summary.mean_delta_hz/sigma if np.isfinite(sigma) and sigma>0 else np.nan
+        noise_warnings='; '.join(sorted(set(str(v) for v in noise['segments'].warning if str(v))))
+        summary['noise_warning']=noise_warnings if np.isfinite(sigma) else '유효 raw baseline noise 구간 없음'
     summary['noise_source']='local_before_after' if len(events)==1 else 'inter_peak'
     return dict(summary=summary,antinodes=pd.DataFrame(antinodes),traces=pd.DataFrame(traces),noise=noise,
                 fit_curves=pd.DataFrame(fit_curves),
@@ -201,12 +209,12 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
                     outer_tolerance_percent=float(outer_tolerance_percent),representative_delta='mean of first and last fitted antinodes',
                     manual_antinode_times={str(key):[float(value) for value in values]
                                            for key,values in manual_antinode_times.items()},
-                    stated_parameters=f'{antinode_count} expected antinodes for selected mode; cubic baseline; 3x interval; quadratic extrema; 20% agreement; 1 Hz order-2 HP noise',
-                    paper_prominence_note='paper reports approximately 5-10 sigma; supplied recording needs 2 sigma to retain all reviewed seven-antinode groups',
-                    inferred_parameters='SG 4/27 data-derived default; 2 sigma prominence; 0.20 interval local fit; outer mean'))
+                    stated_parameters='paper uses seventh mode, cubic baseline, 3x interval, quadratic extrema, 20% agreement, 1 Hz order-2 HP noise',
+                    paper_prominence_note='paper reports approximately 5-10 sigma; current prominence is user-selected on SG baseline residual sigma',
+                    inferred_parameters='user SG/order/mode/prominence/local width; full-event exclusion plus SG support; signed residual fitting; outer mean; single-event local noise extension'))
 
 
-def compare_mit_signal_settings(data, events, settings, manual_antinode_times=None):
+def compare_mit_signal_settings(data, events, settings, manual_antinode_times=None, exclusion_events=None):
     """Report processing sensitivity, not a statistical confidence interval."""
     fs=1/float(np.median(np.diff(data.Time_s.to_numpy(dtype=float))))
     base_window=int(settings.get('sg_window',27)); rows=[]
@@ -222,7 +230,8 @@ def compare_mit_signal_settings(data, events, settings, manual_antinode_times=No
     local=data[(data.Time_s>=lo)&(data.Time_s<=hi)].reset_index(drop=True)
     for window,degree in sorted(variants):
         options=dict(settings,sg_window=window,baseline_degree=degree,compute_noise=False)
-        result=analyze_mit_signal(local,events,manual_antinode_times=manual_antinode_times,**options)
+        result=analyze_mit_signal(local,events,manual_antinode_times=manual_antinode_times,
+                                  exclusion_events=exclusion_events,**options)
         for row in result['summary'].to_dict('records'):
             rows.append({**row,'sg_window_ms':1000*window/fs,'baseline_degree':degree})
     return pd.DataFrame(rows)

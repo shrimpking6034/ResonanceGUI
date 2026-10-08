@@ -76,6 +76,22 @@ def analyze_mit_noise(data, events, guard_s=0.25, cutoff_hz=1.0, order=2,
         if edge_duration_s<=0:raise ValueError('전후 baseline 길이는 양수여야 합니다.')
         intervals=[(max(t_all[0],bounds[0][0]-edge_duration_s),bounds[0][0]),
                    *intervals,(bounds[-1][1],min(t_all[-1],bounds[-1][1]+edge_duration_s))]
+        # A pressure transition is not stationary baseline noise. Split local
+        # extension segments around recorded command changes using the guard.
+        transition_times=[]
+        for col in ('PressureCommand_A_V','PressureCommand_B_V'):
+            if col in data:
+                command=data[col].to_numpy(dtype=float);times=data.Time_s.to_numpy(dtype=float)
+                transition_times.extend(times[1:][np.isfinite(command[1:])&np.isfinite(command[:-1])&(np.diff(command)!=0)])
+        for change in sorted(set(transition_times)):
+            updated=[]
+            for start,end in intervals:
+                left,right=float(change)-guard_s,float(change)+guard_s
+                if right<=start or left>=end:updated.append((start,end))
+                else:
+                    if left>start:updated.append((start,min(left,end)))
+                    if right<end:updated.append((max(right,start),end))
+            intervals=updated
     for segment_index, (start,end) in enumerate(intervals, 1):
         if end <= start:
             rows.append(_empty_segment(segment_index, start, end, 'overlap', '인접 후보의 제외 구간이 겹칩니다.'))
@@ -112,7 +128,8 @@ def analyze_mit_noise(data, events, guard_s=0.25, cutoff_hz=1.0, order=2,
                                   filtered_hz=float(hh), residual_hz=float(rr))
                              for tt, ff, hh, rr in zip(t, f, filtered, residual))
 
-    segments = pd.DataFrame(rows)
+    segments = pd.DataFrame(rows,columns=['segment_index','start_s','end_s','duration_s','sample_count',
+        'sampling_rate_hz','raw_std_hz','sigma_mit_hz','status','warning'])
     residuals = pd.DataFrame(residual_rows, columns=['segment_index', 'time_s', 'frequency_hz', 'filtered_hz', 'residual_hz'])
     valid = segments[segments.status == 'ok']
     if len(residuals):
