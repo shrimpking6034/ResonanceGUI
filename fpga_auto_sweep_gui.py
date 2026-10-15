@@ -22,6 +22,13 @@ THEORY_WIDGETS = ("theory_length_spin", "theory_outer_spin", "theory_inner_spin"
 
 
 class AutoSweepMixin:
+    def _auto_backend(self, plans, modes, settings, directory, beam):
+        parameters = self._fpga_parameters(fixed=True, minimum=plans[0]["low"], maximum=plans[0]["high"])
+        return AutoModeSweepWorker(self.fpga, parameters, modes, settings, directory, {"beam": asdict(beam)})
+
+    def _auto_connected(self):
+        return self.fpga is not None
+
     def _build_auto_controls(self, parent):
         self.auto_worker = None
         self.auto_stages = []
@@ -157,8 +164,8 @@ class AutoSweepMixin:
         if self._auto_busy():
             return
         try:
-            if self.fpga is None:
-                raise RuntimeError("FPGA 연결이 필요합니다.")
+            if not self._auto_connected():
+                raise RuntimeError("장치 연결이 필요합니다.")
             for name in ("sweep_worker", "fpga_error_worker", "fpga_delay_worker", "fpga_response_worker"):
                 worker = getattr(self, name, None)
                 if worker and worker.isRunning():
@@ -177,8 +184,7 @@ class AutoSweepMixin:
                     raise RuntimeError("Plotter 종료 대기 중입니다.")
             if self.pll_enable_btn.isChecked():
                 self.pll_enable_btn.setChecked(False)
-            parameters = self._fpga_parameters(fixed=True, minimum=plans[0]["low"], maximum=plans[0]["high"])
-            worker = AutoModeSweepWorker(self.fpga, parameters, modes, settings, directory, {"beam": asdict(beam)})
+            worker = self._auto_backend(plans, modes, settings, directory, beam)
             self._save_last_settings()
             self.auto_stages = []
             self.auto_records = [dict(mode=p["mode"], theory_hz=p["theory_hz"], status="pending", notes=[]) for p in plans]

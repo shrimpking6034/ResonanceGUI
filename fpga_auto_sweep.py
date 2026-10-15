@@ -205,6 +205,11 @@ SUMMARY_FIELDS = ("mode", "theory_hz", "status", "peak_hz", "f0_hz", "q", "phase
 
 
 class AutoModeSweepWorker(QThread):
+    amplitude_unit = "counts"
+
+    def _make_segment(self, params, grid, settle, samples):
+        return SweepWorker(self.controller, params, grid, settle, samples)
+
     stage_started = pyqtSignal(object)
     point = pyqtSignal(object)
     stage_done = pyqtSignal(object)
@@ -245,7 +250,7 @@ class AutoModeSweepWorker(QThread):
         samples = self.settings.fine_samples if fine else self.settings.coarse_samples
         params = replace(self.parameters, frequency_hz=float(grid[0]),
                          minimum_frequency_hz=float(grid[0]), maximum_frequency_hz=float(grid[-1]))
-        segment = SweepWorker(self.controller, params, grid, settle, samples)
+        segment = self._make_segment(params, grid, settle, samples)
         self.active_segment = segment
         if self.stop_requested:
             segment.stop()
@@ -279,11 +284,14 @@ class AutoModeSweepWorker(QThread):
                     writer = csv.writer(handle)
                     for key, value in meta.items():
                         writer.writerow(["# Metadata", key, value])
-                    writer.writerow(["# Metadata", "Drive_fraction", self.parameters.drive_amplitude_fraction])
+                    drive_key = "Drive_Vpk" if self.amplitude_unit == "V" else "Drive_fraction"
+                    writer.writerow(["# Metadata", drive_key, self.parameters.drive_amplitude_fraction])
+                    writer.writerow(["# Metadata", "Amplitude_unit", self.amplitude_unit])
                     writer.writerow(["# Metadata", "Theory_Hz", record["theory_hz"]])
                     keys = ("freqs", "R", "theta", "X", "Y", "X_sem", "Y_sem", "XY_cov", "n_samples", "requested_freqs")
-                    writer.writerow(["Frequency_Hz", "Amplitude_R_counts", "Phase_deg", "X_counts", "Y_counts",
-                                     "X_SEM_counts", "Y_SEM_counts", "XY_cov_counts2", "N_samples", "Requested_frequency_Hz"])
+                    unit = self.amplitude_unit
+                    writer.writerow(["Frequency_Hz", f"Amplitude_R_{unit}", "Phase_deg", f"X_{unit}", f"Y_{unit}",
+                                     f"X_SEM_{unit}", f"Y_SEM_{unit}", f"XY_cov_{unit}2", "N_samples", "Requested_frequency_Hz"])
                     writer.writerows(zip(*(data[k] for k in keys)))
             record["stages"].append(dict(**meta, file=stem))
             self._save_summary("running")

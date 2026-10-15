@@ -11,6 +11,7 @@ class MitSignalPanel(QtWidgets.QWidget):
     manualAntinodesRequested = QtCore.pyqtSignal(int, object)
     automaticAntinodesRequested = QtCore.pyqtSignal(int)
     sensitivityRequested = QtCore.pyqtSignal()
+    eventBoundsRequested = QtCore.pyqtSignal(int,float,float)
 
     def __init__(self,parent=None):
         super().__init__(parent); self.analysis=None
@@ -24,6 +25,13 @@ class MitSignalPanel(QtWidgets.QWidget):
         self.baseline_guard=QtWidgets.QDoubleSpinBox();self.baseline_guard.setRange(0,10000);self.baseline_guard.setDecimals(2);baseline_controls.addWidget(self.baseline_guard)
         self.sensitivity_btn=QtWidgets.QPushButton('선택 후보 SG / baseline 민감도 비교');self.sensitivity_btn.clicked.connect(self.sensitivityRequested);baseline_controls.addWidget(self.sensitivity_btn)
         baseline_controls.addStretch(1)
+        interval=QtWidgets.QHBoxLayout();layout.addLayout(interval)
+        interval.addWidget(QtWidgets.QLabel('이벤트 시작 (s)'))
+        self.event_start=QtWidgets.QDoubleSpinBox();self.event_start.setDecimals(6);self.event_start.setSingleStep(.01);interval.addWidget(self.event_start)
+        interval.addWidget(QtWidgets.QLabel('끝 (s)'))
+        self.event_end=QtWidgets.QDoubleSpinBox();self.event_end.setDecimals(6);self.event_end.setSingleStep(.01);interval.addWidget(self.event_end)
+        self.apply_bounds_btn=QtWidgets.QPushButton('구간 적용 후 재분석');self.apply_bounds_btn.clicked.connect(self.apply_event_bounds);interval.addWidget(self.apply_bounds_btn)
+        self.interval_info=QtWidgets.QLabel('');interval.addWidget(self.interval_info,1)
         manual=QtWidgets.QHBoxLayout(); layout.addLayout(manual)
         manual.addWidget(QtWidgets.QLabel('수동 시각(s)'))
         self.manual_time=QtWidgets.QDoubleSpinBox();self.manual_time.setDecimals(6);self.manual_time.setSingleStep(.001)
@@ -87,6 +95,13 @@ class MitSignalPanel(QtWidgets.QWidget):
         if row<0:return
         event_index=int(self.analysis['summary'].iloc[row].event_index)
         summary=self.analysis['summary'].iloc[row]
+        s=self.analysis['settings'];center=float(summary.time_s)
+        start=float(summary.get('event_start_s',center));end=float(summary.get('event_end_s',center))
+        valid=np.isfinite([start,end]).all() and end>start
+        if not valid:start,end=center-.25,center+.25
+        for spin,value in ((self.event_start,start),(self.event_end,end)):
+            spin.setRange(s.get('data_start_s',0.),s.get('data_end_s',1e9));spin.setValue(value)
+        self.interval_info.setText('저장된 구간' if valid else '구간 미지정 — 표시 값은 편집용 제안이며 아직 적용되지 않았습니다.')
         self.quality.setText(f"Baseline RMSE {summary.get('baseline_rmse_hz',np.nan):.5f} Hz · 검출용 SG σ {summary.get('detection_sigma_sg_hz',np.nan):.5f} Hz · 간격 CV {summary.get('antinode_spacing_cv',np.nan):.3f} · SG/간격 {summary.get('sg_spacing_ratio',np.nan):.2f}\n{summary.warning}")
         if summary.get('noise_warning',''):self.quality.setText(self.quality.text()+'\nNoise: '+str(summary.noise_warning))
         tr=self.analysis['traces'];tr=tr[tr.event_index==event_index]
@@ -124,6 +139,14 @@ class MitSignalPanel(QtWidgets.QWidget):
 
     def set_cursor_time(self,value):
         if self.cursor.value()!=value:self.cursor.setValue(value)
+
+    def apply_event_bounds(self):
+        if self.analysis is None or self.table.currentRow()<0:return
+        start,end=self.event_start.value(),self.event_end.value()
+        if end<=start:
+            QtWidgets.QMessageBox.warning(self,'이벤트 구간','끝 시각은 시작 시각보다 커야 합니다.');return
+        index=int(self.analysis['summary'].iloc[self.table.currentRow()].event_index)
+        self.eventBoundsRequested.emit(index,start,end)
 
     def _selected(self):
         if self.analysis is None or self.table.currentRow()<0:return None,[]

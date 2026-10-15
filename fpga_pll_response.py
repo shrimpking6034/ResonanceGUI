@@ -123,7 +123,8 @@ def save_step_response(directory, time_s, frequency_hz, segment, result,
     """Save raw response, fitted summary, and a review plot."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    stem = f"fpga_pll_step_{datetime.now():%Y%m%d_%H%M%S}"
+    backend = "HF2LI" if (metadata or {}).get("Backend") == "HF2LI" else "FPGA"
+    stem = f"{backend.lower()}_pll_step_{datetime.now():%Y%m%d_%H%M%S}"
     csv_path = directory / f"{stem}.csv"
     json_path = directory / f"{stem}.json"
     png_path = directory / f"{stem}.png"
@@ -153,12 +154,13 @@ def save_step_response(directory, time_s, frequency_hz, segment, result,
         elapsed = np.maximum(0.0, tf - step_time - result.dead_time_s)
         fit_y = result.baseline_hz + result.step_hz * (1.0 - np.exp(-elapsed / result.tau_s))
         ax.plot(tf, fit_y, color="#d13b73", lw=2.0, label="First-order fit")
-    ax.axvline(step_time, color="#d47b00", ls="--", lw=1, label="Delay step")
+    ax.axvline(step_time, color="#d47b00", ls="--", lw=1,
+               label="Phase setpoint step" if backend == "HF2LI" else "Delay step")
     ax.axvline(restore_time, color="#555", ls="--", lw=1, label="Restore")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("PLL frequency (Hz)")
     ax.set_title(
-        f"FPGA PLL step response: BW={result.bandwidth_hz:.3g} Hz, "
+        f"{backend} PLL step response: BW={result.bandwidth_hz:.3g} Hz, "
         f"tau={result.tau_s:.4g} s, R²={result.r_squared:.3f}")
     ax.grid(True, alpha=0.3)
     ax.legend()

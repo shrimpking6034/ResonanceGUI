@@ -2,6 +2,31 @@
 import numpy as np
 
 
+def window_samples_for_ms(time_s, window_ms, polyorder=4):
+    """Convert a requested duration to the nearest valid odd SG window."""
+    times = np.asarray(time_s, dtype=float)
+    intervals = np.diff(times)
+    intervals = intervals[np.isfinite(intervals) & (intervals > 0)]
+    if not len(intervals) or not np.isfinite(window_ms) or window_ms <= 0:
+        raise ValueError("SG window 변환에 유효한 시간 간격과 ms 값이 필요합니다.")
+    samples = max(1, int(round(float(window_ms) / (1000 * float(np.median(intervals))))))
+    # Choose the nearest odd count; for an even count prefer the longer window.
+    samples += (samples % 2 == 0)
+    minimum = max(3, int(polyorder) + 1)
+    if minimum % 2 == 0:
+        minimum += 1
+    return max(samples, minimum)
+
+
+def filter_frequency_ms(time_s, frequency_hz, enabled=False, window_ms=10.0, polyorder=4):
+    """Apply the same SG filter using a time-based window on this data stream."""
+    if not enabled:
+        return filter_frequency(time_s, frequency_hz, enabled=False)
+    window = window_samples_for_ms(time_s, window_ms, polyorder)
+    return filter_frequency(time_s, frequency_hz, enabled=True,
+                            window_length=window, polyorder=polyorder)
+
+
 def filter_frequency(time_s, frequency_hz, enabled=False, window_length=27, polyorder=4):
     """Return centered SG smoothing with offline-style sample-count settings.
 

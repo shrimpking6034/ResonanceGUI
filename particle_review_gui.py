@@ -195,6 +195,7 @@ class ReviewWindow(QtWidgets.QMainWindow):
         self.mit_signal_panel.manualAntinodesRequested.connect(self.set_manual_antinode_times)
         self.mit_signal_panel.automaticAntinodesRequested.connect(self.restore_automatic_antinodes)
         self.mit_signal_panel.sensitivityRequested.connect(self.compare_mit_sensitivity)
+        self.mit_signal_panel.eventBoundsRequested.connect(self.set_mit_event_bounds)
         self.savgol_panel.order.valueChanged.connect(self.mit_signal_panel.invalidate)
         self.savgol_panel.window.valueChanged.connect(self.mit_signal_panel.invalidate)
         self.mit_guard.valueChanged.connect(self.mit_signal_panel.invalidate)
@@ -467,6 +468,7 @@ class ReviewWindow(QtWidgets.QMainWindow):
         try:e=manual_event(self.data,self.manual_time.value())
         except Exception as exc:self.error(str(exc));return
         self.events.append(e); self.events.sort(key=lambda e:e['time_s']); self.invalidate_particle_properties(); self.refresh_table(); self.table.selectRow(self.events.index(e))
+        self.statusBar().showMessage('수동 후보 시각을 추가했습니다. 통과 전체 구간을 지정한 뒤 적용하세요. MIT 탭에서도 시작/끝을 입력할 수 있습니다.')
 
     def invalidate_particle_properties(self):
         self.property_calibration=None
@@ -746,6 +748,16 @@ class ReviewWindow(QtWidgets.QMainWindow):
 
     def get_noise_settings(self):
         return dict(window_s=self.noise_window.value(),guard_s=self.noise_guard.value(),degree=self.noise_degree.currentIndex()+1)
+
+    def set_mit_event_bounds(self,index,start,end):
+        if not 1<=index<=len(self.events):return
+        if np.count_nonzero((self.data.Time_s>=start)&(self.data.Time_s<=end))<3:
+            self.error('선택 구간에 최소 3개 원시 표본이 필요합니다.');return
+        self.table.selectRow(index-1)
+        self.sample_region.setRegion([start,end])
+        self.apply_selected_region()
+        self.events[index-1].pop('_mit_manual_antinode_times',None)
+        self.calculate_mit_signal(select_event_index=index)
 
     def get_mit_noise_settings(self):
         return dict(guard_s=self.mit_guard.value(), min_duration_s=self.mit_min_duration.value(),

@@ -162,5 +162,36 @@ class MitSignalTests(unittest.TestCase):
                 self.assertIsNone(window.mit_signal_panel.analysis)
             finally:window.close();app.processEvents()
 
+    def test_point_candidate_has_preview_and_can_apply_bounds_in_mit_tab(self):
+        import os
+        os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
+        from PyQt5 import QtWidgets
+        from particle_review_gui import ReviewWindow
+        from particle_review_core import manual_event
+        app=QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        data,_=self.seven_antinode_data()
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'raw.csv';data.to_csv(path,index=False)
+            window=ReviewWindow(calibration_store_path=Path(folder)/'cal.json')
+            errors=[];window.error=errors.append
+            try:
+                window.load_file(path);window.events=[manual_event(window.data,10.)]
+                window.refresh_table();window.table.selectRow(0)
+                window.mode_number.setValue(7);window.savgol_panel.window.setValue(27)
+                window.calculate_mit_signal()
+                panel=window.mit_signal_panel
+                self.assertEqual(errors,[])
+                self.assertEqual(panel.analysis['summary'].iloc[0].status,'invalid_event')
+                self.assertGreater(len(panel.analysis['traces']),0)
+                self.assertEqual(window.events[0]['event_start_s'],window.events[0]['event_end_s'])
+                self.assertIn('구간 미지정',panel.interval_info.text())
+                panel.event_start.setValue(9.93);panel.event_end.setValue(10.07)
+                panel.apply_bounds_btn.click()
+                self.assertEqual(errors,[])
+                self.assertEqual(window.events[0]['event_start_s'],9.93)
+                self.assertEqual(window.events[0]['event_end_s'],10.07)
+                self.assertNotEqual(panel.analysis['summary'].iloc[0].status,'invalid_event')
+            finally:window.close();app.processEvents()
+
 
 if __name__=='__main__':unittest.main()

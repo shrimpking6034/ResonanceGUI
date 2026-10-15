@@ -80,7 +80,12 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
     for index,event in enumerate(events,1):
         start=float(event.get('event_start_s',event['time_s'])); end=float(event.get('event_end_s',event['time_s']))
         if not np.isfinite([start,end]).all() or end<=start:
-            rows.append(_empty(index,event,'invalid_event','유효한 이벤트 시작/끝이 필요합니다.')); continue
+            rows.append(_empty(index,event,'invalid_event','수동 후보는 시각만 저장되었습니다. 이벤트 시작/끝을 지정하고 「구간 적용 후 재분석」을 누르세요.'))
+            preview=(t>=float(event['time_s'])-.5)&(t<=float(event['time_s'])+.5)
+            traces.extend(dict(event_index=index,time_s=float(tt),raw_hz=float(rr),sg_hz=float(ss),
+                               baseline_hz=np.nan,residual_hz=np.nan,baseline_used=False)
+                          for tt,rr,ss in zip(t[preview],raw[preview],smooth[preview]))
+            continue
         approximate_spacing=max((end-start)/max(1,antinode_count-1),4*median_dt)
         outside=_baseline_mask(t,excluded,start,end,baseline_multiplier*approximate_spacing,guard)
         inside=(t>=start)&(t<=end)
@@ -187,8 +192,10 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
                            baseline_hz=float(bb),residual_hz=float(sign*(ss-bb)),baseline_used=bool(used))
                       for tt,rr,ss,bb,used in zip(t[trace_mask],raw[trace_mask],smooth[trace_mask],baseline[trace_mask],outside[trace_mask]))
     summary=pd.DataFrame(rows)
+    summary['event_start_s']=[float(e.get('event_start_s',e['time_s'])) for e in events]
+    summary['event_end_s']=[float(e.get('event_end_s',e['time_s'])) for e in events]
     noise=None
-    if compute_noise:
+    if compute_noise and (summary.status!='invalid_event').any():
         noise=analyze_mit_noise(data,events,guard_s=max(noise_guard_s,guard),min_duration_s=noise_min_duration_s,
                                 include_edges=len(events)==1,edge_duration_s=max(5.,noise_min_duration_s))
         sigma=float(noise['summary']['pooled_sigma_hz'])
@@ -197,9 +204,12 @@ def analyze_mit_signal(data, events, sg_order=4, sg_window=27,
         noise_warnings='; '.join(sorted(set(str(v) for v in noise['segments'].warning if str(v))))
         summary['noise_warning']=noise_warnings if np.isfinite(sigma) else '유효 raw baseline noise 구간 없음'
     summary['noise_source']='local_before_after' if len(events)==1 else 'inter_peak'
-    return dict(summary=summary,antinodes=pd.DataFrame(antinodes),traces=pd.DataFrame(traces),noise=noise,
+    return dict(summary=summary,antinodes=pd.DataFrame(antinodes,columns=['event_index','antinode_index','time_s',
+                'frequency_hz','baseline_hz','delta_hz','locally_quadratic_fitted','fit_start_s','fit_end_s','fit_rmse_hz','selection_source']),
+                traces=pd.DataFrame(traces,columns=['event_index','time_s','raw_hz','sg_hz','baseline_hz','residual_hz','baseline_used']),noise=noise,
                 fit_curves=pd.DataFrame(fit_curves),
                 settings=dict(sg_order=int(sg_order),sg_window=int(sg_window),sampling_rate_hz=fs,
+                    data_start_s=float(t[0]),data_end_s=float(t[-1]),
                     sg_window_ms=1000*sg_window/fs,prominence_sigma=float(prominence_sigma),
                     baseline_degree=int(baseline_degree),baseline_multiplier=float(baseline_multiplier),antinode_count=int(antinode_count),
                     baseline_guard_s=float(baseline_guard_s),effective_baseline_guard_s=guard,

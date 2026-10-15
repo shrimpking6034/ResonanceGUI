@@ -324,7 +324,7 @@ class FPGAClosedLoopStepWorker(QThread):
             self.completed.emit(payload)
 
 
-class FPGAMainWindow(AutoSweepMixin, MainWindow):
+class FPGAMainWindow(MainWindow):
     """Reuse the HF2LI layout, fit, baseline, particle and DAQ workflows."""
 
     def __init__(self):
@@ -1064,6 +1064,7 @@ class FPGAMainWindow(AutoSweepMixin, MainWindow):
         self._last_baseline_ui_update_t = -np.inf
         self._last_filtered_ui_update_t = -np.inf
         self.measurement_metadata = self._capture_measurement_metadata(self.baseline_active)
+        self.measurement_metadata["Temporary_raw_recording"] = bool(self.plotter_spool)
         self.plotter_freq_curve.setData([], [])
         self.plotter_r_curve.setData([], [])
         # Legend clicks can hide a trace, and a restarted worker starts its
@@ -1092,6 +1093,9 @@ class FPGAMainWindow(AutoSweepMixin, MainWindow):
         self.plotter_rate_spin.setEnabled(False)
         self.plotter_start_btn.setEnabled(False)
         self.plotter_stop_btn.setEnabled(True)
+        self._update_plotter_pause_ui(running=True)
+        self.plotter_record_check.setEnabled(False)
+        self.save_plotter_btn.setEnabled(self.plotter_spool is not None)
         self.baseline_start_btn.setEnabled(not baseline)
         self.baseline_stop_btn.setEnabled(baseline)
         self.plotter_worker.start()
@@ -1109,8 +1113,7 @@ class FPGAMainWindow(AutoSweepMixin, MainWindow):
                 self._fpga_fixed_plotter = False
 
     def _on_current_plotter_batch(self, source, batch):
-        if (self.plotter_worker is source and source.isRunning()
-                and self.plotter_spool is not None):
+        if self.plotter_worker is source and source.isRunning():
             self.on_plotter_batch(batch)
 
     def _refresh_plotter_ui(self, t):
@@ -1199,14 +1202,17 @@ class FPGAMainWindow(AutoSweepMixin, MainWindow):
         row = super()._record_plotter_sample(
             t, r, theta, f, x, y, False, np.nan, np.nan,
             demod_latency, pll_latency)
-        row[7] = np.nan  # HF2LI phase setpoint is not an FPGA observation
-        row[11] = np.nan  # lock state unknown, not false
+        if row is not None:
+            row[7] = np.nan  # HF2LI phase setpoint is not an FPGA observation
+            row[11] = np.nan  # lock state unknown, not false
         if self.log_t and self.log_t[-1] == t:
             self.log_pll_target_phase[-1] = np.nan
             self.log_pll_locked[-1] = np.nan
         return row
 
     def on_plotter_batch(self, batch):
+        if self.plotter_paused:
+            return
         super().on_plotter_batch(batch)
         if batch and self.pll_enable_btn.isChecked():
             frequency = float(batch[-1][3])
@@ -1271,6 +1277,9 @@ class FPGAMainWindow(AutoSweepMixin, MainWindow):
         self.amp_enable_btn.setChecked(False)
         self.plotter_start_btn.setEnabled(True)
         self.plotter_stop_btn.setEnabled(False)
+        self.plotter_paused = False
+        self._update_plotter_pause_ui(running=False)
+        self.plotter_record_check.setEnabled(True)
         if self.fpga:
             try:
                 self.fpga.stop_output()

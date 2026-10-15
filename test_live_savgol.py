@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from live_savgol import filter_frequency
+from live_savgol import filter_frequency, filter_frequency_ms, window_samples_for_ms
 
 
 class LiveSavgolTests(unittest.TestCase):
@@ -38,6 +38,17 @@ class LiveSavgolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "데이터 길이"):
             filter_frequency(times, np.ones(10), enabled=True,
                              window_length=27, polyorder=4)
+
+    def test_ms_window_tracks_the_actual_sample_interval(self):
+        fast = np.arange(1000) * .001
+        slow = np.arange(1000) * .002
+        self.assertEqual(window_samples_for_ms(fast, 20, 4), 21)
+        self.assertEqual(window_samples_for_ms(slow, 20, 4), 11)
+        raw = np.sin(fast * 100)
+        filtered, count = filter_frequency_ms(fast, raw, True, 20, 4)
+        expected, _ = filter_frequency(fast, raw, True, 21, 4)
+        self.assertEqual(count, 21)
+        np.testing.assert_allclose(filtered, expected)
 
 
 if __name__ == "__main__":

@@ -257,13 +257,13 @@ class SameLayoutFPGATests(unittest.TestCase):
             window.close()
 
     def test_live_residual_is_aligned_and_display_only(self):
-        from live_savgol import filter_frequency
+        from live_savgol import filter_frequency_ms
         with patch.object(FPGAMainWindow, "_connect_hardware", lambda w: None):
             window = FPGAMainWindow()
         try:
             window.live_savgol_enabled.setChecked(False)
             window.live_residual_enabled.setChecked(True)
-            self.assertTrue(window.live_savgol_window_spin.isEnabled())
+            self.assertTrue(window.live_savgol_window_ms_spin.isEnabled())
             self.assertFalse(window.live_savgol_enabled.isChecked())
             t = np.linspace(0, 1, 1001)
             f = 38000 + t + .1 * np.sin(2 * np.pi * 70 * t)
@@ -274,17 +274,26 @@ class SameLayoutFPGATests(unittest.TestCase):
                 setattr(window, name, values.tolist())
             with patch.object(window, '_update_live_particle_markers'):
                 window._refresh_plotter_ui(1.)
-            expected, n = filter_frequency(t, f, True, 27, 4)
+            expected, n = filter_frequency_ms(t, f, True,
+                                               window.live_savgol_window_ms_spin.value(), 4)
             tx, residual = window.live_residual_curve.getData()
             np.testing.assert_array_equal(tx, t[n//2:-(n//2)])
             np.testing.assert_allclose(residual, (f-expected)[n//2:-(n//2)])
             np.testing.assert_array_equal(window.plot_f, f)
             window.live_savgol_order_spin.setValue(3)
-            cleared = window.live_residual_curve.getData()[0]
-            self.assertTrue(cleared is None or len(cleared) == 0)
+            updated, n = filter_frequency_ms(t, f, True,
+                                              window.live_savgol_window_ms_spin.value(), 3)
+            tx, residual = window.live_residual_curve.getData()
+            np.testing.assert_array_equal(tx, t[n//2:-(n//2)])
+            np.testing.assert_allclose(residual, (f-updated)[n//2:-(n//2)])
+            window.live_savgol_window_ms_spin.setValue(20.0)
+            updated, n = filter_frequency_ms(t, f, True, 20.0, 3)
+            tx, residual = window.live_residual_curve.getData()
+            np.testing.assert_array_equal(tx, t[n//2:-(n//2)])
+            np.testing.assert_allclose(residual, (f-updated)[n//2:-(n//2)])
             window.live_residual_enabled.setChecked(False)
             self.assertTrue(window.live_residual_plot.isHidden())
-            self.assertFalse(window.live_savgol_window_spin.isEnabled())
+            self.assertFalse(window.live_savgol_window_ms_spin.isEnabled())
         finally:
             window.close()
 
