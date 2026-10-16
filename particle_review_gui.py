@@ -2,6 +2,7 @@
 import sys
 import json
 import re
+from datetime import datetime, timedelta
 from copy import deepcopy
 from pathlib import Path
 import numpy as np
@@ -21,6 +22,49 @@ from particle_review_savgol_gui import SavgolPanel
 from particle_review_mit_signal import analyze_mit_signal, compare_mit_signal_settings
 from particle_review_mit_signal_gui import MitSignalPanel
 from particle_review_core import sample_window_stats
+
+
+class OverviewTimeAxis(pg.AxisItem):
+    """Format elapsed x coordinates as recorded local time without moving data."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.local_start = None
+        self.show_local = False
+        self.enableAutoSIPrefix(False)
+
+    def set_time_display(self, start, enabled):
+        self.local_start = start
+        self.show_local = bool(enabled and start is not None)
+        self.picture = None
+        self.update()
+
+    def tickStrings(self, values, scale, spacing):
+        if not self.show_local or self.local_start is None:
+            return super().tickStrings(values, scale, spacing)
+        digits = min(6, max(0, int(np.ceil(-np.log10(spacing))))) if spacing > 0 else 3
+        labels = []
+        for value in values:
+            try:
+                stamp = self.local_start + timedelta(seconds=float(value))
+                label = stamp.strftime('%H:%M:%S')
+                if digits:
+                    label += '.' + f'{stamp.microsecond:06d}'[:digits]
+                if stamp.date() != self.local_start.date():
+                    label = stamp.strftime('%m-%d') + '\n' + label
+                labels.append(label)
+            except (ValueError, OverflowError):
+                labels.append('')
+        return labels
+
+
+def local_measurement_start(metadata):
+    value = metadata.get('Measurement_start_timestamp_local')
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 class Worker(QtCore.QThread):
@@ -200,7 +244,15 @@ class ReviewWindow(QtWidgets.QMainWindow):
         self.savgol_panel.window.valueChanged.connect(self.mit_signal_panel.invalidate)
         self.mit_guard.valueChanged.connect(self.mit_signal_panel.invalidate)
         self.mit_min_duration.valueChanged.connect(self.mit_signal_panel.invalidate)
-        self.overview=pg.PlotWidget(); self.overview.setLabel('left','Frequency',units='Hz'); self.overview.setLabel('bottom','Time',units='s')
+        overview_timebar=QtWidgets.QHBoxLayout(); rl.addLayout(overview_timebar)
+        overview_timebar.addWidget(QtWidgets.QLabel('전체 파형 시간축'))
+        self.overview_local_timestamp=QtWidgets.QCheckBox('Local timestamp (해제: elapsed time)')
+        self.overview_local_timestamp.setEnabled(False)
+        self.overview_local_timestamp.setToolTip('CSV의 Measurement_start_timestamp_local + Time_s로 표시합니다. 시작 시각 정보가 있는 CSV를 여세요.')
+        self.overview_local_timestamp.toggled.connect(self.update_overview_time_display)
+        overview_timebar.addWidget(self.overview_local_timestamp); overview_timebar.addStretch(1)
+        self.overview_time_axis=OverviewTimeAxis(orientation='bottom')
+        self.overview=pg.PlotWidget(axisItems={'bottom':self.overview_time_axis}); self.overview.setLabel('left','Frequency',units='Hz'); self.overview.setLabel('bottom','Elapsed time',units='s')
         self.overview.getAxis('left').enableAutoSIPrefix(False)
         self.overview.setMaximumHeight(220); rl.addWidget(self.overview)
         self.region=pg.LinearRegionItem([0,3]); self.region.setZValue(20); self.overview.addItem(self.region)
@@ -253,10 +305,33 @@ class ReviewWindow(QtWidgets.QMainWindow):
         path,_=QtWidgets.QFileDialog.getOpenFileName(self,'원시 CSV 선택','','CSV (*.csv)')
         if path:self.load_file(path)
 
+    def update_overview_time_display(self, checked=False):
+        start=local_measurement_start(self.metadata)
+        enabled=self.overview_local_timestamp.isChecked() and start is not None
+        self.overview_time_axis.set_time_display(start,enabled)
+        if enabled:
+            zone=start.strftime('%z')
+            zone=f' UTC{zone[:3]}:{zone[3:]}' if zone else ''
+            self.overview.setLabel('bottom',f'Local timestamp — {start:%Y-%m-%d}{zone}',units='')
+        else:
+            self.overview.setLabel('bottom','Elapsed time',units='s')
+
+    def configure_overview_time_display(self):
+        start=local_measurement_start(self.metadata)
+        self.overview_local_timestamp.setEnabled(start is not None)
+        if start is None:
+            with QtCore.QSignalBlocker(self.overview_local_timestamp):
+                self.overview_local_timestamp.setChecked(False)
+            self.overview_local_timestamp.setToolTip('CSV에 유효한 Measurement_start_timestamp_local 정보가 없어 local timestamp를 표시할 수 없습니다.')
+        else:
+            self.overview_local_timestamp.setToolTip(f'CSV 시작 시각 {start.isoformat()} + 원본 Time_s. 축 표기만 바뀌며 분석·구간 선택은 elapsed seconds 기준입니다.')
+        self.update_overview_time_display()
+
     def load_file(self,path):
         try:d,metadata=load_raw(path)
         except Exception as exc:self.error(str(exc)); return
         self.data=d; self.path=Path(path).resolve(); self.metadata=metadata; self.events=[]; self.thresholds=[]; self.last_settings=None; self.property_calibration=None
+        self.configure_overview_time_display()
         mode_value=None
         for key in ('Measurement_mode_number','Mode_number','Resonance_mode_number'):
             try:

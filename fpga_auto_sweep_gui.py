@@ -7,13 +7,14 @@ import json
 import numpy as np
 import pyqtgraph as pg
 from PyQt5.QtWidgets import (QAbstractSpinBox, QCheckBox, QComboBox, QDoubleSpinBox,
-                             QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
+                             QGridLayout, QGroupBox, QHBoxLayout,
                              QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox,
                              QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
                              QHeaderView, QAbstractItemView)
 
 from beam_modes import TubeBeam, calculate_modes
 from fpga_auto_sweep import AutoSweepSettings, AutoModeSweepWorker, build_mode_plans, load_auto_session
+from fpga_i18n import FileDialog as QFileDialog,source_widget_text
 
 
 THEORY_WIDGETS = ("theory_length_spin", "theory_outer_spin", "theory_inner_spin",
@@ -218,11 +219,12 @@ class AutoSweepMixin:
         if locked:
             self._auto_locked_widgets = []
             for widget in self.findChildren(QWidget):
+                if widget.property('fpgaLanguageSelector'): continue
                 if not isinstance(widget, (QPushButton, QAbstractSpinBox, QComboBox, QCheckBox, QLineEdit)):
                     continue
                 if widget in (self.auto_stop_btn, self.stop_sweep_btn, self.auto_view, self.auto_fine_zoom_btn):
                     continue
-                if isinstance(widget, QPushButton) and "긴급 정지" in widget.text():
+                if isinstance(widget, QPushButton) and widget.objectName()=="emergency_stop":
                     continue
                 self._auto_locked_widgets.append((widget, widget.isEnabled()))
             # Snapshot children before disabling their parent spinboxes.
@@ -290,8 +292,8 @@ class AutoSweepMixin:
         accepted = sum(r.get("fit_accepted", False) for r in self.auto_records)
         self.auto_status.setText(f"{outcome['status']} · Fit 통과 {accepted}/{len(self.auto_records)} · {outcome['elapsed_s']:.1f}s")
         if outcome["error"]:
-            self.auto_status.setText(self.auto_status.text() + " · " + outcome["error"])
-        self.status_label.setText(self.auto_status.text())
+            self.auto_status.setText(source_widget_text(self.auto_status) + " · " + outcome["error"])
+        self.status_label.setText(source_widget_text(self.auto_status))
 
     def _update_auto_table(self):
         self.auto_table.setRowCount(len(self.auto_records))

@@ -59,7 +59,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QDoubleSpinBox, QSpinBox, QPushButton, QGroupBox, QListWidget,
     QListWidgetItem, QMessageBox, QComboBox, QProgressBar, QTabWidget,
-    QScrollArea, QCheckBox, QFileDialog, QLineEdit, QToolButton,
+    QScrollArea, QCheckBox, QLineEdit, QToolButton,
     QSizePolicy, QSplitter,
 )
 import pyqtgraph as pg
@@ -83,6 +83,7 @@ from live_savgol import filter_frequency_ms
 from session_storage import PlotterSpool, atomic_json, atomic_sweep
 from allan_export import save_allan_export
 from pressure_monitor import PressureMonitor, pressure_kpa
+from fpga_i18n import FileDialog as QFileDialog,source_widget_text,source_combo_text,source_combo_item
 
 try:
     import nidaqmx
@@ -959,7 +960,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         values = {}
         for name, widget in self._settings_widgets().items():
             if isinstance(widget, QComboBox):
-                values[name] = widget.currentData() if name == "pll_input_combo" else widget.currentText()
+                values[name] = widget.currentData() if name == "pll_input_combo" else source_combo_text(widget)
             elif isinstance(widget, QCheckBox):
                 values[name] = widget.isChecked()
             else:
@@ -984,8 +985,9 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
                         index = widget.findData(value)
                         if index >= 0:
                             widget.setCurrentIndex(index)
-                    elif widget.findText(value) >= 0:
-                        widget.setCurrentText(value)
+                    else:
+                        index=next((i for i in range(widget.count()) if source_combo_item(widget,i)==value),-1)
+                        if index>=0: widget.setCurrentIndex(index)
                 elif isinstance(widget, QCheckBox):
                     widget.setChecked(bool(value))
                 elif isinstance(value, (int, float)) and np.isfinite(value):
@@ -1079,6 +1081,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         left.addStretch(1)
 
         emergency_btn = QPushButton("⚠ 긴급 정지 (모든 출력 0)")
+        emergency_btn.setObjectName("emergency_stop")
         emergency_btn.setStyleSheet(
             "background-color: #c0392b; color: white; font-weight: bold; padding: 10px;"
         )
@@ -1760,17 +1763,20 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         row += 1
 
         estimate_btn = QPushButton("fitted 공진기 모델로 PID 최적화")
+        estimate_btn.setObjectName("pll_pid_advisor")
         estimate_btn.clicked.connect(self.estimate_pll_p)
         layout.addWidget(estimate_btn, row, 0, 1, 2)
         row += 1
 
         calibrate_btn = QPushButton("실제 PLL phase detector 보정 (f0 주변 스캔)")
+        calibrate_btn.setObjectName("pll_phase_calibration")
         calibrate_btn.setToolTip("PLL의 ERROR 노드로 실제 내부 phase detector의 위상 기울기와 resonance setpoint를 측정합니다.")
         calibrate_btn.clicked.connect(self.calibrate_pll_phase_detector)
         layout.addWidget(calibrate_btn, row, 0, 1, 2)
         row += 1
 
         sign_test_btn = QPushButton("안전 P-only feedback sign test (+P / −P)")
+        sign_test_btn.setObjectName("pll_sign_test")
         sign_test_btn.setToolTip("작은 PLL range 안에서 +P와 -P의 오차 RMS를 짧게 비교합니다. 구동이 켜진 상태에서만 실행됩니다.")
         sign_test_btn.clicked.connect(self.test_pll_feedback_sign)
         layout.addWidget(sign_test_btn, row, 0, 1, 2)
@@ -2281,7 +2287,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         self.pressure_monitor_btn.blockSignals(False)
         self.pressure_monitor_btn.setEnabled(True)
         self.pressure_monitor_btn.setText("실제 압력 읽기 시작 (AI0 / AI1)")
-        if self.pressure_readback_label.text() == "압력 읽기 중지 중…":
+        if source_widget_text(self.pressure_readback_label) == "압력 읽기 중지 중…":
             self.pressure_readback_label.setText("압력 읽기 중지됨 · A: —  B: —")
         self.measured_pressure_a = self.measured_pressure_b = None
         self.metadata_actual_pressure_edit.setEnabled(True)
@@ -2627,7 +2633,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         self.tabs.setCurrentIndex(0)
 
         settings = {
-            "filter_mode": self.sweep_filter_mode_combo.currentText(),
+            "filter_mode": source_combo_text(self.sweep_filter_mode_combo),
             "order": self.sweep_filter_order_spin.value(),
             "fixed_bandwidth_hz": self.sweep_fixed_bw_spin.value(),
             "max_bandwidth_hz": self.sweep_max_bw_spin.value(),
@@ -2753,7 +2759,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
                 "Clamp_torque_contact": self.metadata_clamp_edit.text().strip(),
                 "Fluid": self.metadata_fluid_edit.text().strip(),
                 "Triton_concentration": self.metadata_triton_edit.text().strip(),
-                "Triton_basis": self.metadata_triton_basis_combo.currentText(),
+                "Triton_basis": source_combo_text(self.metadata_triton_basis_combo),
                 "Particle_material": self.metadata_particle_edit.text().strip(),
                 "Particle_size_min_um": particle_min,
                 "Particle_size_max_um": particle_max,
@@ -2930,7 +2936,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
             f"(fit window {display_f[0]:,.1f}–{display_f[-1]:,.1f} Hz)"
         )
         if show_msg:
-            QMessageBox.information(self, "복소 공진 fitting 완료", self.fit_result_label.text())
+            QMessageBox.information(self, "복소 공진 fitting 완료", source_widget_text(self.fit_result_label))
         return fit
 
     def calibrate_pll_phase_detector(self):
@@ -2961,7 +2967,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
             previous_freq = self.hf.get_osc_freq()
             reference_setpoint = float(self.pll_setpoint_spin.value())
             input_index = int(self.pll_input_combo.currentData())
-            input_name = self.pll_input_combo.currentText()
+            input_name = source_combo_text(self.pll_input_combo)
             self.hf.set_pll_input(input_index)
             half_span = max(3.0 * fit.linewidth_hz, 0.25)
             # HF2LI starts updating its internal PLL phase detector only
@@ -3112,7 +3118,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
             )
             QMessageBox.warning(
                 self, "불안정 PID 결과 적용 안 함",
-                self.pll_design_label.text() +
+                source_widget_text(self.pll_design_label) +
                 "\n\n기존 P/I/D 값은 변경하지 않았습니다. 현재처럼 Target BW=3 Hz, "
                 "TC=0.002 s, order=2인 조합에서는 먼저 TC를 늘리거나 실제 PLL detector 보정과 "
                 "P-only sign test를 수행하세요.",
@@ -3130,11 +3136,11 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         )
         range_needed = 5.0 * self.pll_target_bw_spin.value()
         if self.pll_range_spin.value() < range_needed:
-            self.pll_design_label.setText(self.pll_design_label.text() +
+            self.pll_design_label.setText(source_widget_text(self.pll_design_label) +
                                           f"  PLL Range는 최소 {range_needed:.3g} Hz를 권장합니다.")
         QMessageBox.information(
             self, "모델 기반 PID 설계 완료",
-            self.pll_design_label.text() + "\n\n계수는 아직 장비에 적용되지 않았습니다. PLL 활성화 시 적용됩니다."
+            source_widget_text(self.pll_design_label) + "\n\n계수는 아직 장비에 적용되지 않았습니다. PLL 활성화 시 적용됩니다."
         )
 
     # --- PLL ---
@@ -3260,7 +3266,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         set_a, set_b = self._parse_pair(self.metadata_set_pressure_edit.text())
         actual_a, actual_b = self._parse_pair(self.metadata_actual_pressure_edit.text())
         particle_min, particle_max = self._parse_size_range(self.metadata_particle_size_edit.text())
-        pressure_source = self.metadata_pressure_source_combo.currentText()
+        pressure_source = source_combo_text(self.metadata_pressure_source_combo)
         if self.pressure_monitor_btn.isChecked():
             self._expire_pressure_sample()
             actual_a = self.measured_pressure_a if self.measured_pressure_a is not None else np.nan
@@ -3298,7 +3304,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
             "Clamp_torque_contact": self.metadata_clamp_edit.text().strip(),
             "Fluid": self.metadata_fluid_edit.text().strip(),
             "Triton_concentration": self.metadata_triton_edit.text().strip(),
-            "Triton_basis": self.metadata_triton_basis_combo.currentText(),
+            "Triton_basis": source_combo_text(self.metadata_triton_basis_combo),
             "Particle_material": self.metadata_particle_edit.text().strip(),
             "Particle_size_min_um": particle_min,
             "Particle_size_max_um": particle_max,
@@ -3494,7 +3500,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
             new_events.append(event)
         self.live_particle_events.sort(key=lambda event: event['time_s'])
         if new_events:
-            if self.live_event_list.count() == 1 and "여기에" in self.live_event_list.item(0).text():
+            if self.live_event_list.count() == 1 and "여기에" in source_widget_text(self.live_event_list.item(0)):
                 self.live_event_list.clear()
             for event in new_events:
                 number = self.live_particle_events.index(event) + 1
@@ -3910,7 +3916,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
             "X (V)": self.plot_x,
             "Y (V)": self.plot_y,
         }
-        source = channel_map[self.hist_channel_combo.currentText()]
+        source = channel_map[source_combo_text(self.hist_channel_combo)]
         if len(source) >= 5:
             arr = np.asarray(source)
             std = float(np.std(arr))
@@ -3919,9 +3925,9 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
             centers = 0.5 * (edges[:-1] + edges[1:])
             width = (edges[1] - edges[0]) * 0.9 if len(edges) > 1 else 1.0
             self.plotter_hist_item.setOpts(x=centers, height=counts, width=width)
-            self.plotter_hist_plot.setLabel('bottom', self.hist_channel_combo.currentText())
+            self.plotter_hist_plot.setLabel('bottom', source_combo_text(self.hist_channel_combo))
             self.plotter_std_label.setText(
-                f"Std ({self.hist_channel_combo.currentText()}): {std:.6g}   Mean: {mean:.6g}   N={len(arr)}"
+                f"Std ({source_combo_text(self.hist_channel_combo)}): {std:.6g}   Mean: {mean:.6g}   N={len(arr)}"
             )
         # Recent-window fitting is intentionally slower than the live Plotter.
         # Disk logging remains at the device stream rate.
@@ -4060,7 +4066,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
             source.get("demod_latency_s"), source.get("pll_latency_s"),
             (self.baseline_rolling_window_spin.value(),) if self.baseline_rolling_window_spin.value() > 0 else (),
             self.threshold_calibration_source, self.baseline_source_role,
-            self.detection_method_combo.currentText(), self.metadata_distance_spin.value(),
+            source_combo_text(self.detection_method_combo), self.metadata_distance_spin.value(),
         )
         self.baseline_analysis_worker.completed.connect(self.on_baseline_analysis_ready)
         self.baseline_analysis_worker.failed.connect(self.on_baseline_analysis_failed)
@@ -4635,7 +4641,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
             except Exception:
                 pass
         self.zero_daq_channels()
-        self.status_label.setText(self.status_label.text() + "  [긴급 정지 실행됨]")
+        self.status_label.setText(source_widget_text(self.status_label) + "  [긴급 정지 실행됨]")
 
     # --- cleanup ---
     def closeEvent(self, event):

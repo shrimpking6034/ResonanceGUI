@@ -118,6 +118,24 @@ class SameLayoutFPGATests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
+        # These legacy tests exercise error calibration/streaming in isolation.
+        # The complete new startup gate is covered by test_fpga_initial_resonance.
+        def legacy_start(window):
+            window._pll_start_validated=True
+            if window.fpga_auto_delay_check.isChecked():
+                return window._start_fpga_delay_calibration(start_tracking=True)
+            window._start_fpga_closed_loop()
+            return True
+        startup_patch=patch.object(FPGAMainWindow,"start_pll_preflight",legacy_start)
+        startup_patch.start()
+        self.addCleanup(startup_patch.stop)
+        original_build=FPGAMainWindow._build_refinement_controls
+        def build_without_hardware_refinement(window,group):
+            original_build(window,group)
+            window.fpga_peak_auto_check.setChecked(False)
+        refinement_patch=patch.object(FPGAMainWindow,"_build_refinement_controls",build_without_hardware_refinement)
+        refinement_patch.start()
+        self.addCleanup(refinement_patch.stop)
         self.state_temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.state_temp.cleanup)
         self.state_patch = patch.object(hf_module, "STATE_DIR",

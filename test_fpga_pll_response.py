@@ -8,6 +8,20 @@ from fpga_pll_response import analyze_step_response, save_step_response
 
 
 class PLLStepResponseTests(unittest.TestCase):
+    def test_drift_and_underresolved_transition(self):
+        t=np.arange(0,3,.001)
+        y=39000+.12*t
+        mask=t>=.5
+        y[mask]+=2*(1-np.exp(-(t[mask]-.5)/.02))
+        result=analyze_step_response(t,y,step_time_s=.5,restore_time_s=2.2,delay_step_turns=.001)
+        self.assertTrue(result.accepted,result.reasons)
+        self.assertAlmostEqual(result.tau_s,.02,delta=.001)
+        self.assertAlmostEqual(result.drift_hz_per_s,.12,delta=.01)
+        fast=y.copy()
+        fast[mask]=39000+.12*t[mask]+2*(1-np.exp(-(t[mask]-.5)/.0002))
+        result=analyze_step_response(t,fast,step_time_s=.5,restore_time_s=2.2,delay_step_turns=.001)
+        self.assertFalse(result.accepted)
+
     def test_recovers_first_order_bandwidth_and_saves_artifacts(self):
         rng = np.random.default_rng(12)
         rate = 1000.0

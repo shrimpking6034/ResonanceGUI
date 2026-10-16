@@ -27,6 +27,9 @@ class PLLStepResponse:
     r_squared: float
     accepted: bool
     reasons: tuple[str, ...]
+    drift_hz_per_s: float = 0.0
+    samples_per_tau: float = 0.0
+    tau_standard_error_s: float = float("nan")
 
 
 def _mad_sigma(values: np.ndarray) -> float:
@@ -65,10 +68,10 @@ def analyze_step_response(time_s, frequency_hz, *, step_time_s: float,
     tau0 = max(5.0 * dt, min(duration / 5.0, 0.1))
 
     def model(p):
-        base, amplitude, log_tau, dead = p
+        base, amplitude, log_tau, dead, drift = p
         tau = np.exp(log_tau)
         elapsed = np.maximum(0.0, ts - dead)
-        return base + amplitude * (1.0 - np.exp(-elapsed / tau))
+        return base + drift*ts + amplitude * (1.0 - np.exp(-elapsed / tau))
 
     scale = max(noise_sigma, abs(initial_step) * 0.02, np.finfo(float).eps)
 
@@ -79,24 +82,36 @@ def analyze_step_response(time_s, frequency_hz, *, step_time_s: float,
     upper_tau = max(duration * 10.0, lower_tau * 10.0)
     result = least_squares(
         residuals,
-        np.array([baseline, initial_step, np.log(tau0), 0.0]),
+        np.array([baseline, initial_step, np.log(tau0), 0.0, 0.0]),
         bounds=(
-            [-np.inf, -np.inf, np.log(lower_tau), 0.0],
-            [np.inf, np.inf, np.log(upper_tau), max(dt, 0.25 * duration)],
+            [-np.inf, -np.inf, np.log(lower_tau), 0.0, -np.inf],
+            [np.inf, np.inf, np.log(upper_tau), max(dt, 0.25 * duration), np.inf],
         ),
         loss="soft_l1", max_nfev=5000,
     )
     fitted = model(result.x)
-    base_fit, amplitude, log_tau, dead = map(float, result.x)
+    base_fit, amplitude, log_tau, dead, drift = map(float, result.x)
     tau = float(np.exp(log_tau))
     residual_power = float(np.sum((ys - fitted) ** 2))
     signal_power = float(np.sum((ys - np.mean(ys)) ** 2))
     r_squared = float(1.0 - residual_power / max(signal_power, np.finfo(float).tiny))
     direction = 1.0 if amplitude >= 0 else -1.0
-    normalized = direction * (ys - base_fit) / max(abs(amplitude), np.finfo(float).tiny)
+    normalized = direction * (ys - base_fit - drift*ts) / max(abs(amplitude), np.finfo(float).tiny)
     overshoot = max(0.0, float((np.max(normalized) - 1.0) * 100.0))
     bandwidth = float(1.0 / (2.0 * np.pi * tau))
     reasons = []
+    tau_se = float("nan")
+    try:
+        covariance = np.linalg.pinv(result.jac.T @ result.jac) * (2*result.cost/max(1,len(ys)-5))
+        tau_se = tau * float(np.sqrt(max(0,covariance[2,2])))
+    except np.linalg.LinAlgError:
+        pass
+    if tau/dt < 3:
+        reasons.append(f"시상수당 {tau/dt:.1f} samples로 전이 구간 시간 해상도가 부족합니다.")
+    if np.isfinite(tau_se) and tau_se > .5*tau:
+        reasons.append("시상수 추정 불확실성이 50%를 넘습니다.")
+    if not result.success:
+        reasons.append("응답 fitting이 수렴하지 않았습니다.")
     steady_uncertainty = noise_sigma / np.sqrt(max(1, len(steady)))
     if abs(amplitude) <= max(0.01, 6.0 * steady_uncertainty):
         reasons.append("delay step에 대한 주파수 변화가 baseline noise와 구별되지 않습니다.")
@@ -115,6 +130,7 @@ def analyze_step_response(time_s, frequency_hz, *, step_time_s: float,
         overshoot_percent=overshoot, settling_2pct_s=float(dead + 3.912 * tau),
         noise_sigma_hz=noise_sigma, r_squared=r_squared,
         accepted=not reasons, reasons=tuple(reasons),
+        drift_hz_per_s=drift, samples_per_tau=tau/dt, tau_standard_error_s=tau_se,
     )
 
 
@@ -152,7 +168,8 @@ def save_step_response(directory, time_s, frequency_hz, segment, result,
     tf = t[fit_mask]
     if len(tf):
         elapsed = np.maximum(0.0, tf - step_time - result.dead_time_s)
-        fit_y = result.baseline_hz + result.step_hz * (1.0 - np.exp(-elapsed / result.tau_s))
+        fit_y = (result.baseline_hz + result.drift_hz_per_s*(tf-step_time)
+                 + result.step_hz * (1.0 - np.exp(-elapsed / result.tau_s)))
         ax.plot(tf, fit_y, color="#d13b73", lw=2.0, label="First-order fit")
     ax.axvline(step_time, color="#d47b00", ls="--", lw=1,
                label="Phase setpoint step" if backend == "HF2LI" else "Delay step")

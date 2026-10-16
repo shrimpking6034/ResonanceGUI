@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import QDoubleSpinBox, QLabel, QMessageBox, QPushButton
 
 from fpga_auto_sweep import AutoModeSweepWorker
 from fpga_auto_sweep_gui import AutoSweepMixin
+from fpga_i18n import source_combo_text
 from fpga_pll_response import analyze_step_response, save_step_response
 
 
@@ -291,7 +292,7 @@ class HF2FeaturesMixin(AutoSweepMixin):
         return self._auto_busy() or bool(response and response.isRunning())
 
     def _hf2_sweep_settings(self):
-        return dict(filter_mode=self.sweep_filter_mode_combo.currentText(),
+        return dict(filter_mode=source_combo_text(self.sweep_filter_mode_combo),
                     order=self.sweep_filter_order_spin.value(),
                     fixed_bandwidth_hz=self.sweep_fixed_bw_spin.value(),
                     max_bandwidth_hz=self.sweep_max_bw_spin.value(),
