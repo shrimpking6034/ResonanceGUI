@@ -6,6 +6,27 @@ from live_savgol import filter_frequency, filter_frequency_ms, window_samples_fo
 
 
 class LiveSavgolTests(unittest.TestCase):
+    def test_fourth_order_large_frequency_preserves_dc_and_dip(self):
+        t = np.arange(5000) / 12500
+        change = -.05 * np.exp(-.5 * ((t - .2) / .025) ** 2)
+        raw = 39061. + change
+        original = raw.copy()
+        filtered, _ = filter_frequency(t, raw, True, 1251, 4)
+        from scipy.signal import savgol_filter
+        expected = 39061. + savgol_filter(change, 1251, 4)
+        np.testing.assert_allclose(filtered, expected, rtol=0, atol=1e-7)
+        np.testing.assert_array_equal(raw, original)
+        constant, _ = filter_frequency(t, np.full(len(t), 39061.), True, 1251, 4)
+        np.testing.assert_array_equal(constant, np.full(len(t), 39061.))
+
+    def test_other_orders_keep_existing_calculation(self):
+        from scipy.signal import savgol_filter
+        t = np.arange(2000) / 12500
+        raw = 39061. + .01 * np.sin(t * 100)
+        for order in (1, 2, 3, 5, 6, 7, 8):
+            actual, _ = filter_frequency(t, raw, True, 1251, order)
+            np.testing.assert_array_equal(actual, savgol_filter(raw, 1251, order))
+
     def test_disabled_returns_exact_raw_samples(self):
         times = np.arange(100) * .001
         raw = np.sin(times * 100)

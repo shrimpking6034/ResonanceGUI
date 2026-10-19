@@ -2,7 +2,7 @@
 import numpy as np
 from PyQt5 import QtCore, QtWidgets
 import pyqtgraph as pg
-from scipy.signal import savgol_filter
+from live_savgol import savgol_frequency
 
 
 class SavgolPanel(QtWidgets.QWidget):
@@ -161,7 +161,7 @@ class SavgolPanel(QtWidgets.QWidget):
         t = self.data.Time_s.to_numpy(dtype=float)
         y = self.data.Frequency_Hz.to_numpy(dtype=float)
         try:
-            self.filtered = savgol_filter(y, window_length=window, polyorder=order, mode='interp')
+            self.filtered = savgol_frequency(y, window_length=window, polyorder=order)
         except ValueError as exc:
             self.info.setText(str(exc)); return
 

@@ -83,6 +83,7 @@ from live_savgol import filter_frequency_ms
 from session_storage import PlotterSpool, atomic_json, atomic_sweep
 from allan_export import save_allan_export
 from pressure_monitor import PressureMonitor, pressure_kpa
+from camera_link_gui import CameraLinkMixin
 from fpga_i18n import FileDialog as QFileDialog,source_widget_text,source_combo_text,source_combo_item
 
 try:
@@ -814,7 +815,7 @@ if __name__ == "__main__":
 from hf2_features import HF2FeaturesMixin
 
 
-class MainWindow(HF2FeaturesMixin, QMainWindow):
+class MainWindow(CameraLinkMixin, HF2FeaturesMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Steel-Tube Resonator Control (HF2LI + NI-DAQ) v{APP_VERSION}")
@@ -927,6 +928,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         self.pingpong_settle_until_t = None
         self.pingpong_events = []  # list of (t, depth_hz, duration_s)
 
+        self._init_camera_link()
         self._build_ui()
         if not hasattr(self, "fpga"):
             self._build_auto_results()
@@ -1073,6 +1075,8 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         section = self._build_plotter_group()
         left.addWidget(CollapsibleSection(section.title(), section, expanded=False))
         section = self._build_live_particle_group()
+        left.addWidget(CollapsibleSection(section.title(), section, expanded=False))
+        section = self._build_camera_link_group(STATE_DIR)
         left.addWidget(CollapsibleSection(section.title(), section, expanded=False))
         section = self._build_daq_group()
         left.addWidget(CollapsibleSection(section.title(), section, expanded=False))
@@ -3324,6 +3328,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         }
 
     def _reset_plotter_logs(self):
+        self._camera_new_measurement()
         if self.plotter_spool is not None:
             self.plotter_spool.discard()
         self.plotter_spool = PlotterSpool() if self.plotter_record_check.isChecked() else None
@@ -3519,6 +3524,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         self.live_count_value.setText(str(len(self.live_particle_events)))
         self.live_export_btn.setEnabled(bool(self.live_particle_events))
         self._update_live_particle_markers()
+        self._send_camera_events(new_events)
 
     def on_live_particle_failed(self, message):
         worker = self.sender()
@@ -3749,6 +3755,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
 
     def _record_plotter_sample(self, t, r, theta, f, x, y, locked, phase_error,
                                correction, demod_latency, pll_latency):
+        self._camera_observe_sample(t)
         if self.pingpong_active and not self.baseline_active:
             self._pingpong_step(t, f)
         pressure_a, pressure_b, flow_direction, switch_state = self._pressure_log_state()
@@ -4674,6 +4681,7 @@ class MainWindow(HF2FeaturesMixin, QMainWindow):
         if self.plotter_spool is not None:
             self.plotter_spool.discard()
             self.plotter_spool = None
+        self._close_camera_link()
         if self.hf:
             self.hf.close()
         event.accept()

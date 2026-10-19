@@ -2,6 +2,18 @@
 import numpy as np
 
 
+def savgol_frequency(values, window_length, polyorder):
+    """Avoid fourth-order SG DC error on large absolute frequencies."""
+    from scipy.signal import savgol_filter
+
+    values = np.asarray(values, dtype=float)
+    if polyorder == 4:
+        reference = float(np.mean(values))
+        return savgol_filter(values - reference, window_length, polyorder,
+                             mode="interp") + reference
+    return savgol_filter(values, window_length, polyorder, mode="interp")
+
+
 def window_samples_for_ms(time_s, window_ms, polyorder=4):
     """Convert a requested duration to the nearest valid odd SG window."""
     times = np.asarray(time_s, dtype=float)
@@ -52,8 +64,7 @@ def filter_frequency(time_s, frequency_hz, enabled=False, window_length=27, poly
         pass
     else:
         # Use the same implementation and boundary mode as the offline panel.
-        return savgol_filter(values, window_length=window,
-                             polyorder=order, mode="interp"), window
+        return savgol_frequency(values, window, order), window
     radius = window // 2
     offsets = np.arange(-radius, radius + 1, dtype=float)
     design = np.vander(offsets, N=order + 1, increasing=True)
